@@ -1140,6 +1140,7 @@ pub fn process_all_files(
                 continue;
             }
         };
+        reader.set_delimiter(if context.null_data { b'\0' } else { b'\n' });
         let output = in_place.begin(&path)?;
 
         if context.separate || index == 0 {

@@ -1437,6 +1437,47 @@ fn word_start_and_end_match_in_basic_and_extended_regexes() {
     }
 }
 
+/// `-z` reads NUL-terminated records from files and pipes, with `-s` and `-i` too; a newline
+/// inside a record is ordinary data. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn null_data_splits_file_and_pipe_input_at_nul() {
+    let dir = tempfile::tempdir().unwrap();
+    let (f, g) = (dir.path().join("f"), dir.path().join("g"));
+    std::fs::write(&f, b"a\0b\nc\0d").unwrap();
+    std::fs::write(&g, b"e\0f\0").unwrap();
+    new_ucmd!()
+        .args(&["-z", "s/^/X/"])
+        .arg(&f)
+        .succeeds()
+        .stdout_is_bytes(b"Xa\0Xb\nc\0Xd");
+    new_ucmd!()
+        .args(&["-z", "s/^/X/"])
+        .pipe_in(b"a\0b\nc\0d".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"Xa\0Xb\nc\0Xd");
+    new_ucmd!()
+        .args(&["-z", "-s", "1d"])
+        .arg(&f)
+        .arg(&g)
+        .succeeds()
+        .stdout_is_bytes(b"b\nc\0d\0f\0");
+    new_ucmd!()
+        .args(&["-z", "-i", "1d"])
+        .arg(&f)
+        .arg(&g)
+        .succeeds()
+        .no_stdout();
+    assert_eq!(std::fs::read(&f).unwrap(), b"b\nc\0d");
+    assert_eq!(std::fs::read(&g).unwrap(), b"f\0");
+    std::fs::write(&f, b"a\nb\n").unwrap();
+    new_ucmd!()
+        .arg("s/^/X/")
+        .arg(&f)
+        .succeeds()
+        .stdout_is("Xa\nXb\n");
+}
+
 /// With `-s` or `-i`, an `n` or `N` at a file's last line ends there: under `-n` the next
 /// file starts its own script from the top. Verified against the oracle.
 #[test]
