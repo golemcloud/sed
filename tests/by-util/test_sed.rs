@@ -1377,6 +1377,27 @@ fn n_joins_across_file_operands_without_separate() {
         .stdout_is_bytes(b"a\nb");
 }
 
+/// `\<` and `\>` match only at a word's start and end, in BREs and EREs alike. Verified
+/// against the oracle.
+#[test]
+fn word_start_and_end_match_in_basic_and_extended_regexes() {
+    for mode in [None, Some("-E")] {
+        for (input, script, expected) in [
+            ("xcat a cat\n", r"s/\<cat/X/g", "xcat a X\n"),
+            ("ab cd\n", r"s/\</X/g", "Xab Xcd\n"),
+            ("ab cd\n", r"s/\>/X/", "abX cd\n"),
+            ("xcat cat cats\n", r"s/\<cat\>/X/g", "xcat X cats\n"),
+        ] {
+            new_ucmd!()
+                .env("LC_ALL", "C.UTF-8")
+                .args(&mode.into_iter().chain([script]).collect::<Vec<_>>())
+                .pipe_in(input)
+                .succeeds()
+                .stdout_is(expected);
+        }
+    }
+}
+
 /// With `-s` or `-i`, an `n` or `N` at a file's last line ends there: under `-n` the next
 /// file starts its own script from the top. Verified against the oracle.
 #[test]

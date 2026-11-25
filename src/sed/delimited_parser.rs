@@ -619,19 +619,21 @@ pub fn parse_regex_for_mode(
                 // `\b` must reach the RE engine as a word-boundary assertion (`\x08` is
                 // spelled `\cH` or `\x08` in a GNU sed RE), and `\<`/`\>` (word start/end,
                 // which no supported RE engine spells natively) are translated into
-                // lookaround assertions built on `\w`.
+                // lookaround assertions built on `\w`, spelled for `bre_to_ere` in a BRE (see
+                // `push_pattern_escaped_char`).
                 if line.current() == 'b' {
                     result.extend_from_slice(br"\b");
                     line.advance();
                     continue;
                 }
-                if line.current() == '<' {
-                    result.extend_from_slice(br"(?<!\w)(?=\w)");
-                    line.advance();
-                    continue;
-                }
-                if line.current() == '>' {
-                    result.extend_from_slice(br"(?<=\w)(?!\w)");
+                if line.current() == '<' || line.current() == '>' {
+                    let assertion: &[u8] = match (line.current(), regex_mode) {
+                        ('<', RegexMode::Basic) => br"\(\?<!\w\)\(\?=\w\)",
+                        ('<', RegexMode::Extended) => br"(?<!\w)(?=\w)",
+                        (_, RegexMode::Basic) => br"\(\?<=\w\)\(\?!\w\)",
+                        (_, RegexMode::Extended) => br"(?<=\w)(?!\w)",
+                    };
+                    result.extend_from_slice(assertion);
                     line.advance();
                     continue;
                 }
