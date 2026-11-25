@@ -446,6 +446,7 @@ fn substitute(
             write_named(
                 writer,
                 output,
+                context,
                 pattern.as_bytes(),
                 pattern.is_newline_terminated(),
             )?;
@@ -457,9 +458,11 @@ fn substitute(
 }
 
 /// Writes a `w` line to its file or, for `/dev/stdout`, to sed's own output as GNU sed does.
+/// A terminated line ends with the record delimiter, NUL under `-z`.
 fn write_named(
     writer: &RefCell<crate::sed::named_writer::NamedWriter>,
     output: &mut OutputBuffer,
+    context: &ProcessingContext,
     line: &[u8],
     newline: bool,
 ) -> UResult<()> {
@@ -467,7 +470,10 @@ fn write_named(
         output.write_chunk(&IOChunk::from_bytes(line.to_vec(), newline))?;
         return Ok(());
     }
-    writer.borrow_mut().write_line_bytes(line, newline)
+    let delimiter = if context.null_data { b'\0' } else { b'\n' };
+    writer
+        .borrow_mut()
+        .write_line_bytes(line, newline, delimiter)
 }
 
 /// Apply the specified transliteration in the provided pattern space.
@@ -992,6 +998,7 @@ pub fn process_line(
                     write_named(
                         writer,
                         output,
+                        context,
                         pattern.as_bytes(),
                         pattern.is_newline_terminated(),
                     )?;
@@ -1009,6 +1016,7 @@ pub fn process_line(
                     write_named(
                         writer,
                         output,
+                        context,
                         first_line,
                         !found_newline && pattern.is_newline_terminated(),
                     )?;

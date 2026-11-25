@@ -79,7 +79,7 @@ impl NamedWriter {
 
     /// Write String to the file, possibly with a newline, returning errors.
     pub fn write_line(&mut self, line: &str, newline: bool) -> UResult<()> {
-        self.write_line_bytes(line.as_bytes(), newline)
+        self.write_line_bytes(line.as_bytes(), newline, b'\n')
     }
 
     /// Whether this writes to sed's own output (`/dev/stdout`), which the caller then does.
@@ -87,8 +87,8 @@ impl NamedWriter {
         self.writer.is_none()
     }
 
-    /// Write bytes to the file, possibly with a newline, returning errors.
-    pub fn write_line_bytes(&mut self, line: &[u8], newline: bool) -> UResult<()> {
+    /// Write bytes to the file, possibly terminated with `delimiter`, returning errors.
+    pub fn write_line_bytes(&mut self, line: &[u8], newline: bool, delimiter: u8) -> UResult<()> {
         let Some(writer) = self.writer.as_mut() else {
             return Ok(());
         };
@@ -96,7 +96,7 @@ impl NamedWriter {
             .write_all(line)
             .and_then(|()| {
                 if newline {
-                    writer.write_all(b"\n")
+                    writer.write_all(&[delimiter])
                 } else {
                     Ok(())
                 }
@@ -150,7 +150,7 @@ mod tests {
 
         writer
             .borrow_mut()
-            .write_line_bytes(b"a\xE9", true)
+            .write_line_bytes(b"a\xE9", true, b'\n')
             .unwrap();
         writer.borrow_mut().flush().unwrap();
 
@@ -165,7 +165,7 @@ mod tests {
 
         writer
             .borrow_mut()
-            .write_line_bytes(b"a\xE9", false)
+            .write_line_bytes(b"a\xE9", false, b'\n')
             .unwrap();
         writer.borrow_mut().flush().unwrap();
 

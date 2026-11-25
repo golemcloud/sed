@@ -1437,6 +1437,40 @@ fn word_start_and_end_match_in_basic_and_extended_regexes() {
     }
 }
 
+/// Under `-z`, `w`, `W` and the `s///w` flag end each record they write with NUL, for file,
+/// pipe and `-i` input. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn null_data_write_commands_end_records_with_nul() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("o");
+    for (script, expected) in [("w", &b"a\0b\0"[..]), ("W", b"a\0b\0"), ("s/b/B/w", b"B\0")] {
+        new_ucmd!()
+            .arg("-z")
+            .arg("-n")
+            .arg(format!("{script} {}", out.display()))
+            .pipe_in(b"a\0b\0".to_vec())
+            .succeeds();
+        assert_eq!(std::fs::read(&out).unwrap(), expected, "{script}");
+    }
+    let f = dir.path().join("f");
+    std::fs::write(&f, b"a\0b\0").unwrap();
+    new_ucmd!()
+        .arg("-z")
+        .arg("-i")
+        .arg(format!("w {}", out.display()))
+        .arg(&f)
+        .succeeds();
+    assert_eq!(std::fs::read(&out).unwrap(), b"a\0b\0");
+    assert_eq!(std::fs::read(&f).unwrap(), b"a\0b\0");
+    new_ucmd!()
+        .arg("-n")
+        .arg(format!("w {}", out.display()))
+        .pipe_in("a\nb\n")
+        .succeeds();
+    assert_eq!(std::fs::read(&out).unwrap(), b"a\nb\n");
+}
+
 /// `-z` reads NUL-terminated records from files and pipes, with `-s` and `-i` too; a newline
 /// inside a record is ordinary data. Verified against the oracle.
 #[test]
