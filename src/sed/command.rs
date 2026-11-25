@@ -143,12 +143,20 @@ pub enum CaseConversion {
 /// Replacement text under GNU case conversion.
 #[derive(Default)]
 struct CasedText {
+    mode: CharacterMode,
     text: Vec<u8>,
     span: Option<CaseConversion>,
     next: Option<CaseConversion>,
 }
 
 impl CasedText {
+    fn new(mode: CharacterMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+
     fn convert(&mut self, conversion: CaseConversion) {
         match conversion {
             CaseConversion::Upper | CaseConversion::Lower => self.span = Some(conversion),
@@ -157,33 +165,51 @@ impl CasedText {
         }
     }
 
+    /// The conversion for the next character: `\u`/`\l` once, else the `\U`/`\L` span.
+    fn take(&mut self) -> Option<CaseConversion> {
+        self.next.take().or(self.span)
+    }
+
+    /// Append `bytes`, converting one character at a time. Only ASCII letters have case in a
+    /// byte locale; invalid UTF-8 has none in a UTF-8 locale. Such bytes stay as they are.
     fn push(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
         if self.span.is_none() && self.next.is_none() {
             self.text.extend_from_slice(bytes);
             return;
         }
-        let text = String::from_utf8_lossy(bytes);
-        let mut chars = text.chars();
-        if let Some(next) = self.next.take()
-            && let Some(first) = chars.next()
-        {
-            match next {
-                CaseConversion::UpperNext => {
-                    self.text.extend(first.to_uppercase().to_string().bytes());
+        if self.mode == CharacterMode::Byte {
+            for &byte in bytes {
+                let conversion = self.take();
+                self.text.push(match conversion {
+                    Some(CaseConversion::Upper | CaseConversion::UpperNext) => {
+                        byte.to_ascii_uppercase()
+                    }
+                    Some(CaseConversion::Lower | CaseConversion::LowerNext) => {
+                        byte.to_ascii_lowercase()
+                    }
+                    _ => byte,
+                });
+            }
+            return;
+        }
+        for chunk in bytes.utf8_chunks() {
+            for ch in chunk.valid().chars() {
+                let mut buf = [0; 4];
+                match self.take() {
+                    Some(CaseConversion::Upper | CaseConversion::UpperNext) => {
+                        self.text.extend(ch.to_uppercase().to_string().bytes());
+                    }
+                    Some(CaseConversion::Lower | CaseConversion::LowerNext) => {
+                        self.text.extend(ch.to_lowercase().to_string().bytes());
+                    }
+                    _ => self.text.extend(ch.encode_utf8(&mut buf).bytes()),
                 }
-                _ => self.text.extend(first.to_lowercase().to_string().bytes()),
+            }
+            if !chunk.invalid().is_empty() {
+                self.take();
+                self.text.extend_from_slice(chunk.invalid());
             }
         }
-        let rest: String = chars.collect();
-        let rest = match self.span {
-            Some(CaseConversion::Upper) => rest.to_uppercase(),
-            Some(CaseConversion::Lower) => rest.to_lowercase(),
-            _ => rest,
-        };
-        self.text.extend(rest.bytes());
     }
 }
 
@@ -232,9 +258,14 @@ impl ReplacementTemplate {
     /// Apply the template to the given RE captures.
     /// Example:
     /// let result = regex.replace_all(input, |caps: &Captures| {
-    ///    template.apply_captures(&command, caps) });
+    ///    template.apply_captures(&command, caps, mode) });
     /// Returns an error if a backreference in the template was not matched by the RE.
-    pub fn apply_captures(&self, command: &Command, caps: &Captures) -> UResult<Vec<u8>> {
+    pub fn apply_captures(
+        &self,
+        command: &Command,
+        caps: &Captures,
+        mode: CharacterMode,
+    ) -> UResult<Vec<u8>> {
         let mut result = Vec::new();
 
         // Invalid group numbers may end here through (unkown at compile time)
@@ -249,7 +280,7 @@ impl ReplacementTemplate {
             );
         }
 
-        let mut cased = CasedText::default();
+        let mut cased = CasedText::new(mode);
         for part in &self.parts {
             match part {
                 ReplacementPart::Literal(s) => cased.push(s),
@@ -272,8 +303,8 @@ impl ReplacementTemplate {
     }
 
     /// Apply the template to the given RE single match.
-    pub fn apply_match(&self, m: &Match) -> Vec<u8> {
-        let mut cased = CasedText::default();
+    pub fn apply_match(&self, m: &Match, mode: CharacterMode) -> Vec<u8> {
+        let mut cased = CasedText::new(mode);
 
         for part in &self.parts {
             match part {
@@ -503,7 +534,9 @@ mod tests {
         let caps = caps_for("foo", input);
         let cmd = Command::default();
 
-        let result = template.apply_captures(&cmd, &caps).unwrap();
+        let result = template
+            .apply_captures(&cmd, &caps, CharacterMode::Utf8)
+            .unwrap();
         assert_eq!(result, b"");
     }
 
@@ -515,7 +548,9 @@ mod tests {
         let caps = caps_for("abc", input);
         let cmd = Command::default();
 
-        let result = template.apply_captures(&cmd, &caps).unwrap();
+        let result = template
+            .apply_captures(&cmd, &caps, CharacterMode::Utf8)
+            .unwrap();
         assert_eq!(result, b"hello");
     }
 
@@ -530,7 +565,9 @@ mod tests {
         let caps = caps_for(r"foo\d+", input);
         let cmd = Command::default();
 
-        let result = template.apply_captures(&cmd, &caps).unwrap();
+        let result = template
+            .apply_captures(&cmd, &caps, CharacterMode::Utf8)
+            .unwrap();
         assert_eq!(result, b"got: foo42");
     }
 
@@ -543,7 +580,7 @@ mod tests {
         ]);
         let m = Match::from_bytes(1, 3, b"\xE9x");
 
-        assert_eq!(template.apply_match(&m), b"<\xE9x>");
+        assert_eq!(template.apply_match(&m, CharacterMode::Utf8), b"<\xE9x>");
     }
 
     #[test]
@@ -557,7 +594,9 @@ mod tests {
         let caps = caps_for(r"foo(\d+)", input);
         let cmd = Command::default();
 
-        let result = template.apply_captures(&cmd, &caps).unwrap();
+        let result = template
+            .apply_captures(&cmd, &caps, CharacterMode::Utf8)
+            .unwrap();
         assert_eq!(result, b"number: 42");
     }
 
@@ -574,7 +613,9 @@ mod tests {
         let caps = caps_for(r"(\w+):(\d+)", input);
         let cmd = Command::default();
 
-        let result = template.apply_captures(&cmd, &caps).unwrap();
+        let result = template
+            .apply_captures(&cmd, &caps, CharacterMode::Utf8)
+            .unwrap();
         assert_eq!(result, b"key: x, value: 123");
     }
 
@@ -591,7 +632,7 @@ mod tests {
         let caps = caps_for(r"(\w+):(\d+)", input);
         let cmd = Command::default();
 
-        let result = template.apply_captures(&cmd, &caps);
+        let result = template.apply_captures(&cmd, &caps, CharacterMode::Utf8);
         assert!(result.is_err());
 
         let msg = result.unwrap_err().to_string();

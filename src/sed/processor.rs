@@ -327,6 +327,7 @@ fn substitute(
     output: &mut OutputBuffer,
 ) -> UResult<()> {
     let sub = extract_variant!(command, Substitution);
+    let mode = context.character_mode;
 
     let mut count = 0;
     let mut last_end = 0;
@@ -347,7 +348,7 @@ fn substitute(
                 Ok(Some(m)) => {
                     result.extend_from_slice(&text[last_end..m.start()]);
 
-                    let replacement = sub.replacement.apply_match(&m);
+                    let replacement = sub.replacement.apply_match(&m, mode);
                     result.extend_from_slice(&replacement);
                     replaced = true;
                     last_end = m.end();
@@ -365,7 +366,7 @@ fn substitute(
                     let m = caps.get(0)?.unwrap();
                     result.extend_from_slice(&text[last_end..m.start()]);
 
-                    let replacement = sub.replacement.apply_captures(command, &caps)?;
+                    let replacement = sub.replacement.apply_captures(command, &caps, mode)?;
                     result.extend_from_slice(&replacement);
                     replaced = true;
                     last_end = m.end();
@@ -395,7 +396,7 @@ fn substitute(
                         || count == sub.occurrence
                         || (sub.global && count > sub.occurrence)
                     {
-                        let replacement = sub.replacement.apply_captures(command, &caps)?;
+                        let replacement = sub.replacement.apply_captures(command, &caps, mode)?;
                         result.extend_from_slice(&replacement);
                         replaced = true;
                     } else {

@@ -1377,6 +1377,45 @@ fn n_joins_across_file_operands_without_separate() {
         .stdout_is_bytes(b"a\nb");
 }
 
+/// Case conversion changes only letters the locale has: ASCII in the C locale, every valid
+/// character in a UTF-8 locale, one character at a time as GNU does. Other bytes, including
+/// invalid UTF-8, stay as they are and still use up a `\u`. Verified against the oracle, except
+/// that GNU 4.9 writes `\xff` for each byte above ASCII it converts in the C locale.
+#[test]
+fn case_conversion_keeps_bytes_without_case() {
+    for (locale, script, input, expected) in [
+        (
+            "C",
+            r"s/.*/\U&/",
+            &b"\xffa\xe9b\n"[..],
+            &b"\xffA\xe9B\n"[..],
+        ),
+        ("C", r"s/.*/\U&/", "éa\n".as_bytes(), "éA\n".as_bytes()),
+        ("C", r"s/.*/\u&/", b"\xffab\n", b"\xffab\n"),
+        ("C.UTF-8", r"s/a/\U\xff&\xe9/", b"a\n", b"\xffA\xe9\n"),
+        ("C.UTF-8", r"s/a/\u\xff&/", b"a\n", b"\xffa\n"),
+        (
+            "C.UTF-8",
+            r"s/.*/\U&/",
+            "éa\n".as_bytes(),
+            "ÉA\n".as_bytes(),
+        ),
+        (
+            "C.UTF-8",
+            r"s/.*/\L&/",
+            "ΣΑΣ ΑΣ\n".as_bytes(),
+            "σασ ασ\n".as_bytes(),
+        ),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", locale)
+            .arg(script)
+            .pipe_in(input.to_vec())
+            .succeeds()
+            .stdout_is_bytes(expected);
+    }
+}
+
 /// `\<` and `\>` match only at a word's start and end, in BREs and EREs alike. Verified
 /// against the oracle.
 #[test]
