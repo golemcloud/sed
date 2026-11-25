@@ -1497,6 +1497,27 @@ fn unterminated_last_line_stays_unterminated_after_n_and_d() {
     }
 }
 
+/// `l` shows a newline inside the pattern space as `\n`, with or without `-z`, and counts it
+/// toward the line width. Verified against the oracle.
+#[test]
+fn list_writes_embedded_newline_as_escape() {
+    new_ucmd!()
+        .args(&["-n", "N;l"])
+        .pipe_in("a\nb")
+        .succeeds()
+        .stdout_is("a\\nb$\n");
+    new_ucmd!()
+        .args(&["-n", "N;l 4"])
+        .pipe_in("ab\ncd\n")
+        .succeeds()
+        .stdout_is("ab\\\n\\nc\\\nd$\n");
+    new_ucmd!()
+        .args(&["-z", "-n", "N;l"])
+        .pipe_in(b"a\nb\0c\0".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"a\\nb\\000c$\0");
+}
+
 /// With `-s` or `-i`, an `n` or `N` at a file's last line ends there: under `-n` the next
 /// file starts its own script from the top. Verified against the oracle.
 #[test]
