@@ -765,12 +765,14 @@ pub fn process_line(
         // regardless of the actual last line's own terminator (`printf 'a\nb' | sed 'N;D'` →
         // `b\n`, even though `b` itself has no newline in the input).
         let started_as_continuation = context.input_action.is_some();
+        // The record delimiter that `N`, `G` and `H` join with and `D`, `P` and `W` split at.
+        let delimiter = if context.null_data { b'\0' } else { b'\n' };
         // Set the script command from which to start.
         let mut current: Option<Rc<RefCell<Command>>> =
             if let Some(action) = context.input_action.take() {
                 if let Some(mut combined_lines) = action.prepend {
                     // Continue processing the `N` command.
-                    combined_lines.push(if context.null_data { b'\0' } else { b'\n' });
+                    combined_lines.push(delimiter);
                     combined_lines.extend_from_slice(pattern.as_bytes());
                     pattern.set_to_bytes(combined_lines, pattern.is_newline_terminated());
                 }
@@ -835,8 +837,8 @@ pub fn process_line(
                     break;
                 }
                 'D' => {
-                    // Delete up to \n and start a new cycle without new input.
-                    if let Some(pos) = memchr(b'\n', pattern.as_bytes()) {
+                    // Delete up to the delimiter and start a new cycle without new input.
+                    if let Some(pos) = memchr(delimiter, pattern.as_bytes()) {
                         let (s, _) = pattern.fields_mut()?;
                         s.drain(..=pos);
                         current.clone_from(&commands);
@@ -867,9 +869,9 @@ pub fn process_line(
                     pattern.set_to_bytes(context.hold.content.clone(), context.hold.has_newline);
                 }
                 'G' => {
-                    // Append to pattern \n followed by hold space contents.
+                    // Append to pattern the delimiter followed by hold space contents.
                     let (pat_content, pat_has_newline) = pattern.fields_mut()?;
-                    pat_content.push(b'\n');
+                    pat_content.push(delimiter);
                     pat_content.extend_from_slice(&context.hold.content);
                     *pat_has_newline = context.hold.has_newline;
                 }
@@ -879,8 +881,8 @@ pub fn process_line(
                     context.hold.has_newline = pattern.is_newline_terminated();
                 }
                 'H' => {
-                    // Append to hold \n followed by pattern space contents.
-                    context.hold.content.push(b'\n');
+                    // Append to hold the delimiter followed by pattern space contents.
+                    context.hold.content.push(delimiter);
                     context.hold.content.extend_from_slice(pattern.as_bytes());
                     context.hold.has_newline = pattern.is_newline_terminated();
                 }
@@ -930,8 +932,8 @@ pub fn process_line(
                 }
                 'P' => {
                     let line = pattern.as_bytes();
-                    if let Some(pos) = memchr(b'\n', line) {
-                        output.write_bytes(&line[..=pos])?;
+                    if let Some(pos) = memchr(delimiter, line) {
+                        output.write_chunk(&IOChunk::from_bytes(line[..pos].to_vec(), true))?;
                     } else {
                         write_chunk(output, context, &pattern)?;
                     }
@@ -1022,7 +1024,7 @@ pub fn process_line(
                     let writer = extract_variant!(command, NamedWriter);
                     let pattern_bytes = pattern.as_bytes();
                     let (first_line, found_newline) =
-                        match pattern_bytes.iter().position(|&b| b == b'\n') {
+                        match pattern_bytes.iter().position(|&b| b == delimiter) {
                             // A slice including the newline
                             Some(pos) => (&pattern_bytes[..=pos], true),
                             None => (pattern_bytes, false),
