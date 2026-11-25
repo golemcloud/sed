@@ -1426,6 +1426,15 @@ fn word_start_and_end_match_in_basic_and_extended_regexes() {
                 .stdout_is(expected);
         }
     }
+    // In a BRE, a `*` after `\<` or `\>` has nothing to repeat and is a literal `*`.
+    for (script, expected) in [(r"s/\>*/X/", "fooXbar\n"), (r"s/\<*/X/", "foo*bar\n")] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .arg(script)
+            .pipe_in("foo*bar\n")
+            .succeeds()
+            .stdout_is(expected);
+    }
 }
 
 /// `-z` reads NUL-terminated records from files and pipes, with `-s` and `-i` too; a newline

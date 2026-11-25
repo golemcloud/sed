@@ -635,6 +635,16 @@ pub fn parse_regex_for_mode(
                     };
                     result.extend_from_slice(assertion);
                     line.advance();
+                    // In a BRE, a `*` with nothing to repeat is a literal `*`, and an
+                    // assertion leaves nothing to repeat.
+                    if matches!(regex_mode, RegexMode::Basic)
+                        && delimiter != '*'
+                        && !line.eol()
+                        && line.current() == '*'
+                    {
+                        result.extend_from_slice(br"\*");
+                        line.advance();
+                    }
                     continue;
                 }
                 if let Some(decoded) = parse_char_escape(line) {
