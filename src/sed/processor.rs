@@ -714,7 +714,10 @@ fn process_file(
     while let Some(pattern) = reader.get_line()? {
         process_line(commands.clone(), pattern, reader, output, context)?;
         if context.stop_processing {
-            output.flush_pending_newline()?;
+            // `q` ends its line with a terminator; `n` quitting at the last line does not.
+            if context.quit_code.is_some() {
+                output.flush_pending_newline()?;
+            }
             break;
         }
     }
@@ -756,17 +759,6 @@ pub fn process_line(
     {
         context.line_number += 1;
         context.substitution_made = false;
-        // Whether this call is continuing a pending `n`/`N` from an earlier call, rather than
-        // starting a fresh cycle on a just-read line. `N`'s own EOF fallback (further down,
-        // and in `Engine::finish`/`process_all_files`'s "N command remains" handling) uses
-        // this: verified against the oracle, GNU only preserves a truly-final, unterminated
-        // input line's own missing newline when `N` reaches end of input on its very first,
-        // untouched attempt (`printf 'a' | sed 'N'` → no added newline). Once `N` has already
-        // joined a line once, a *later* `N` hitting end of input in the same cycle — reached
-        // through `D`'s restart-without-reading, in every case checked — gets one added
-        // regardless of the actual last line's own terminator (`printf 'a\nb' | sed 'N;D'` →
-        // `b\n`, even though `b` itself has no newline in the input).
-        let started_as_continuation = context.input_action.is_some();
         // The record delimiter that `N`, `G` and `H` join with and `D`, `P` and `W` split at.
         let delimiter = if context.null_data { b'\0' } else { b'\n' };
         // Set the script command from which to start.
@@ -923,8 +915,7 @@ pub fn process_line(
                     // to perform when the next line is read.
                     context.input_action = Some(InputAction {
                         next_command: command.next.clone(),
-                        // See `started_as_continuation`'s own comment above.
-                        terminated: pattern.is_newline_terminated() || started_as_continuation,
+                        terminated: pattern.is_newline_terminated(),
                         prepend: Some(pattern.as_bytes().to_vec()),
                     });
                     return Ok(());

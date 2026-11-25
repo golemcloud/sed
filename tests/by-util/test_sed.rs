@@ -1324,18 +1324,6 @@ fn n_at_true_eof_does_not_add_a_missing_terminator() {
         .stdout_is_bytes(b"a\n");
 }
 
-/// Once `N` has already joined a line, a *later* `N` reaching end of input in the same cycle
-/// (reached through `D`'s restart-without-reading) gets a terminator added regardless of the
-/// actual last line's own — a genuine GNU quirk, verified against the oracle both ways.
-#[test]
-fn n_at_eof_after_d_restart_adds_a_terminator_even_when_the_last_line_lacks_one() {
-    new_ucmd!()
-        .args(&["-e", "N", "-e", "D"])
-        .pipe_in(b"a\nb".to_vec())
-        .succeeds()
-        .stdout_is_bytes(b"b\n");
-}
-
 /// `-s` inserts the record terminator between two file operands when the first one's last
 /// line lacked one, carrying `pending_newline` across `InPlace::begin`'s per-file
 /// `OutputBuffer` (FB-078/FA-077's `-s`-interaction discovery) — `N` reaches true end of
@@ -1479,6 +1467,34 @@ fn null_data_splits_file_and_pipe_input_at_nul() {
         .arg(&f)
         .succeeds()
         .stdout_is("Xa\nXb\n");
+}
+
+/// Output keeps a missing terminator on the last input line when `n` quits there or `N` finds
+/// no next line, also after `D` restarts the cycle, with or without `-z`. `q` still adds one.
+/// Verified against the oracle.
+#[test]
+fn unterminated_last_line_stays_unterminated_after_n_and_d() {
+    for (script, input, expected) in [
+        ("n", "a\nb\nc", "a\nb\nc"),
+        ("n;d", "a\nb\nc", "a\nc"),
+        ("n;p", "a", "a"),
+        ("N;D", "a\nb", "b"),
+        ("N;P;D", "a\nb\nc", "a\nb\nc"),
+        ("N;N;D", "a\nb\nc", "b\nc"),
+        ("N;D", "a\nb\n", "b\n"),
+        ("q", "a", "a\n"),
+    ] {
+        new_ucmd!()
+            .arg(script)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+        new_ucmd!()
+            .args(&["-z", script])
+            .pipe_in(input.replace('\n', "\0"))
+            .succeeds()
+            .stdout_is(expected.replace('\n', "\0"));
+    }
 }
 
 /// With `-s` or `-i`, an `n` or `N` at a file's last line ends there: under `-n` the next
@@ -1650,7 +1666,7 @@ fn test_uppercase_delete_prevents_automatic_printing() {
         .args(&["-e", "N", "-e", "D"])
         .pipe_in("line1\nline2\nline3")
         .succeeds()
-        .stdout_is("line3\n");
+        .stdout_is("line3");
 }
 
 ////////////////////////////////////////////////////////////

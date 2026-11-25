@@ -146,7 +146,10 @@ impl Engine {
             &mut self.context,
         )?;
         let flow = if self.context.stop_processing {
-            self.output.flush_pending_newline()?;
+            // `q` ends its line with a terminator; `n` quitting at the last line does not.
+            if self.context.quit_code.is_some() {
+                self.output.flush_pending_newline()?;
+            }
             Flow::Quit
         } else {
             Flow::Continue
@@ -276,6 +279,13 @@ mod tests {
         let script = format!("N;W {}", file.path().display());
         assert_eq!(run(&["-n", "-z", &script], "a\0b\0").0, "");
         assert_eq!(std::fs::read(file.path()).unwrap(), b"a\0");
+    }
+
+    #[test]
+    fn unterminated_last_line_stays_unterminated() {
+        assert_eq!(run(&["n"], "a\nb\nc").0, "a\nb\nc");
+        assert_eq!(run(&["N;D"], "a\nb").0, "b");
+        assert_eq!(run(&["q"], "a").0, "a\n");
     }
 
     #[test]
