@@ -1377,21 +1377,24 @@ fn n_joins_across_file_operands_without_separate() {
         .stdout_is_bytes(b"a\nb");
 }
 
-/// Case conversion changes only letters the locale has: ASCII in the C locale, every valid
-/// character in a UTF-8 locale, one character at a time as GNU does. Other bytes, including
-/// invalid UTF-8, stay as they are and still use up a `\u`. Verified against the oracle, except
-/// that GNU 4.9 writes `\xff` for each byte above ASCII it converts in the C locale.
+/// Case conversion follows GNU 4.9. In the C locale it cases ASCII letters, leaves other ASCII
+/// bytes, and writes `\xff` for each byte above ASCII it converts; bytes outside a conversion
+/// stay. In a UTF-8 locale it converts valid characters one at a time, and invalid UTF-8 stays
+/// as it is while still using up a `\u`. Verified against the oracle.
 #[test]
-fn case_conversion_keeps_bytes_without_case() {
+fn case_conversion_follows_the_locale() {
     for (locale, script, input, expected) in [
         (
             "C",
             r"s/.*/\U&/",
             &b"\xffa\xe9b\n"[..],
-            &b"\xffA\xe9B\n"[..],
+            &b"\xffA\xffB\n"[..],
         ),
-        ("C", r"s/.*/\U&/", "éa\n".as_bytes(), "éA\n".as_bytes()),
+        ("C", r"s/.*/\U&/", "éa\n".as_bytes(), b"\xff\xffA\n"),
+        ("C", r"s/.*/\U&/", b"a!0\x7f\n", b"A!0\x7f\n"),
         ("C", r"s/.*/\u&/", b"\xffab\n", b"\xffab\n"),
+        ("C", r"s/.*/\l&/", b"\x80A\n", b"\xffA\n"),
+        ("C", r"s/.*/\L&\E\x80/", b"A\xe9\n", b"a\xff\x80\n"),
         ("C.UTF-8", r"s/a/\U\xff&\xe9/", b"a\n", b"\xffA\xe9\n"),
         ("C.UTF-8", r"s/a/\u\xff&/", b"a\n", b"\xffa\n"),
         (

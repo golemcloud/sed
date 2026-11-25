@@ -170,8 +170,9 @@ impl CasedText {
         self.next.take().or(self.span)
     }
 
-    /// Append `bytes`, converting one character at a time. Only ASCII letters have case in a
-    /// byte locale; invalid UTF-8 has none in a UTF-8 locale. Such bytes stay as they are.
+    /// Append `bytes`, converting one character at a time. In a byte locale GNU 4.9 cases ASCII
+    /// letters and writes `\xff` for each byte above ASCII it converts. Invalid UTF-8 has no
+    /// case in a UTF-8 locale and stays as it is.
     fn push(&mut self, bytes: &[u8]) {
         if self.span.is_none() && self.next.is_none() {
             self.text.extend_from_slice(bytes);
@@ -181,13 +182,14 @@ impl CasedText {
             for &byte in bytes {
                 let conversion = self.take();
                 self.text.push(match conversion {
+                    Some(CaseConversion::End) | None => byte,
+                    Some(_) if !byte.is_ascii() => 0xff,
                     Some(CaseConversion::Upper | CaseConversion::UpperNext) => {
                         byte.to_ascii_uppercase()
                     }
                     Some(CaseConversion::Lower | CaseConversion::LowerNext) => {
                         byte.to_ascii_lowercase()
                     }
-                    _ => byte,
                 });
             }
             return;
