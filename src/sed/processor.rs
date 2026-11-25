@@ -718,14 +718,15 @@ fn process_file(
         }
     }
 
-    // Handle any N command remains.
+    // A separate file's last `n` or `N` ends with the file; only `N`'s pending line prints.
     if context.separate
-        && !context.quiet
         && let Some(InputAction {
-            prepend: Some(pending),
+            prepend,
             terminated,
             ..
         }) = context.input_action.take()
+        && !context.quiet
+        && let Some(pending) = prepend
     {
         // Preserve the input's own "last line has no terminator" property (FB-078/FA-077):
         // `write_chunk` (not `write_bytes`, which sniffs `bytes.ends_with(b"\n")` — wrong for

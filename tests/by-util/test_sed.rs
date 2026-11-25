@@ -1377,6 +1377,33 @@ fn n_joins_across_file_operands_without_separate() {
         .stdout_is_bytes(b"a\nb");
 }
 
+/// With `-s` or `-i`, an `n` or `N` at a file's last line ends there: under `-n` the next
+/// file starts its own script from the top. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn next_line_continuation_stops_at_separate_file_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (f1, f2) = (dir.path().join("f1"), dir.path().join("f2"));
+    for (script, expected) in [("n;p", "c\n"), ("N;p", "b\nc\n")] {
+        std::fs::write(&f1, b"a\n").unwrap();
+        std::fs::write(&f2, b"b\nc\n").unwrap();
+        new_ucmd!()
+            .args(&["-s", "-n", script])
+            .arg(&f1)
+            .arg(&f2)
+            .succeeds()
+            .stdout_is(expected);
+        new_ucmd!()
+            .args(&["-i", "-n", script])
+            .arg(&f1)
+            .arg(&f2)
+            .succeeds()
+            .no_stdout();
+        assert_eq!(std::fs::read(&f1).unwrap(), b"");
+        assert_eq!(std::fs::read_to_string(&f2).unwrap(), expected);
+    }
+}
+
 /// Reject raw invalid UTF-8 transliteration script bytes in UTF-8 mode.
 #[test]
 fn trans_raw_invalid_script_byte_rejected_in_c_utf8_locale() {
