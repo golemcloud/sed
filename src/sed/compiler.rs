@@ -813,24 +813,6 @@ fn bre_to_ere(pattern: &[u8]) -> Vec<u8> {
 /// Compile the provided regular expression string into a corresponding engine.
 /// An empty pattern results in None, which means that the last RE employed
 /// at runtime will be used.
-/// Replace every occurrence of `from` in `bytes` with `to` (a simple byte-substring replace,
-/// not a regex) — used to widen `[:alpha:]` to a Unicode-aware class under a UTF-8 locale (see
-/// `compile_regex`), where the pattern is a `Vec<u8>`, not a `String`.
-fn replace_bytes(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(from) {
-            out.extend_from_slice(to);
-            i += from.len();
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
 fn compile_regex(
     lines: &ScriptLineProvider,
     line: &ScriptCharProvider,
@@ -849,18 +831,6 @@ fn compile_regex(
         pattern.to_vec()
     } else {
         bre_to_ere(pattern)
-    };
-
-    // `[:alpha:]` (POSIX bracket class) stays ASCII-only no matter what — a hard limitation of
-    // the `regex` crate's own POSIX classes, verified with a standalone probe
-    // (`regex::bytes::RegexBuilder::new("[[:alpha:]]*").unicode(true)` still won't match "é").
-    // GNU's own `[:alpha:]` is locale-aware, so under a UTF-8 locale this widens it to match any
-    // Unicode letter instead, the same way `\w` already does under `unicode(true)`. Under the
-    // byte/C locale it's left alone, since GNU's own `[:alpha:]` there is ASCII-only too.
-    let pattern = if context.character_mode == CharacterMode::Byte {
-        pattern
-    } else {
-        replace_bytes(&pattern, b"[:alpha:]", br"\p{Alphabetic}")
     };
 
     // Add any required modifiers.
@@ -1385,7 +1355,8 @@ fn compile_write_file_command(
 }
 
 // Handles R (GNU): like 'r', but queues one line from `path` per invocation instead of
-// the whole file. A missing or unreadable file behaves as empty, never an error.
+// the whole file. A missing or unreadable file behaves as empty, never an error. Every `R`
+// that names the same file shares one reader, so each reads the next line.
 fn compile_read_line_command(
     lines: &mut ScriptLineProvider,
     line: &mut ScriptCharProvider,
@@ -1396,7 +1367,18 @@ fn compile_read_line_command(
         return compilation_error(lines, line, ERR_SANDBOX);
     }
     let path = read_file_path(lines, line)?;
-    cmd.data = CommandData::NamedReader(Rc::new(RefCell::new(NamedReader::new(path))));
+    let reader = if let Some(reader) = context
+        .read_line_files
+        .iter()
+        .find(|reader| reader.borrow().path == path)
+    {
+        Rc::clone(reader)
+    } else {
+        let reader = Rc::new(RefCell::new(NamedReader::new(path)));
+        context.read_line_files.push(Rc::clone(&reader));
+        reader
+    };
+    cmd.data = CommandData::NamedReader(reader);
     Ok(CommandHandling::Continue)
 }
 
@@ -2211,19 +2193,6 @@ mod tests {
         let (lines, chars) = dummy_providers();
         let result = compile_regex(&lines, &chars, "a[d", &ctx(), false, false);
         assert!(result.is_err()); // Should fail due to open bracketed expression
-    }
-
-    #[test]
-    fn test_alpha_class_matches_unicode_letters_under_utf8() {
-        // `[:alpha:]` is locale-aware in GNU sed; under a UTF-8 locale (`ctx()`'s default) it
-        // should match a non-ASCII letter, not just A-Za-z — verified against the oracle
-        // (`sed 's/[[:alpha:]]/A/g'` on "héllo wörld" -> "AAAAA AAAAA").
-        let (lines, chars) = dummy_providers();
-        let regex = compile_regex(&lines, &chars, "[[:alpha:]]", &ctx(), false, false)
-            .unwrap()
-            .expect("regex should be present");
-        assert!(regex.is_match(&mut IOChunk::new_from_str("é")).unwrap());
-        assert!(regex.is_match(&mut IOChunk::new_from_str("ö")).unwrap());
     }
 
     #[test]

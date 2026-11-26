@@ -58,6 +58,7 @@ pub struct MmapLineCursor<'a> {
     fast_copy: FastCopy, // Data for fast file copy I/O
     data: &'a [u8],      // Mmapped data
     pos: usize,          // Position within the data
+    delimiter: u8,       // Record terminator: NUL with `-z`, else newline
 }
 
 #[cfg(unix)]
@@ -75,6 +76,7 @@ impl<'a> MmapLineCursor<'a> {
             _file: file,
             data,
             pos: 0,
+            delimiter: b'\n',
         }
     }
 
@@ -86,19 +88,19 @@ impl<'a> MmapLineCursor<'a> {
 
         let start = self.pos;
 
-        let mut end = if let Some(pos) = memchr(b'\n', &self.data[start..]) {
+        let mut end = if let Some(pos) = memchr(self.delimiter, &self.data[start..]) {
             pos + start
         } else {
             self.data.len()
         };
 
         if end < self.data.len() {
-            end += 1; // include \n in full span
+            end += 1; // include the delimiter in full span
         }
 
         self.pos = end;
         let full_span = &self.data[start..end];
-        let content = if full_span.ends_with(b"\n") {
+        let content = if full_span.last() == Some(&self.delimiter) {
             &full_span[..full_span.len() - 1]
         } else {
             full_span
@@ -117,6 +119,7 @@ impl<'a> MmapLineCursor<'a> {
 pub struct ReadLineCursor {
     reader: Box<dyn BufRead>,
     buffer: Vec<u8>,
+    delimiter: u8, // Record terminator: NUL with `-z`, else newline
 }
 
 impl ReadLineCursor {
@@ -126,6 +129,7 @@ impl ReadLineCursor {
         Self {
             reader: Box::new(buf),
             buffer: Vec::new(),
+            delimiter: b'\n',
         }
     }
 
@@ -133,12 +137,12 @@ impl ReadLineCursor {
     fn get_line(&mut self) -> io::Result<Option<(Vec<u8>, bool)>> {
         self.buffer.clear();
         // read_line *includes* the '\n' if present
-        let bytes_read = self.reader.read_until(b'\n', &mut self.buffer)?;
+        let bytes_read = self.reader.read_until(self.delimiter, &mut self.buffer)?;
         if bytes_read == 0 {
             return Ok(None);
         }
         // O(1) check whether it ended in '\n'
-        let has_newline = self.buffer.ends_with(b"\n");
+        let has_newline = self.buffer.last() == Some(&self.delimiter);
         // strip it if you don’t want to expose it to the caller
         if has_newline {
             self.buffer.pop();
@@ -200,13 +204,9 @@ impl<'a> IOChunk<'a> {
         match &self.content {
             IOChunkContent::Owned { has_newline, .. } => *has_newline,
             #[cfg(unix)]
-            IOChunkContent::MmapInput { full_span, .. } => {
-                if let Some(&last) = full_span.last() {
-                    last == b'\n'
-                } else {
-                    false
-                }
-            }
+            IOChunkContent::MmapInput {
+                content, full_span, ..
+            } => full_span.len() > content.len(),
         }
     }
 
@@ -295,7 +295,7 @@ impl<'a> IOChunk<'a> {
             IOChunkContent::MmapInput {
                 content, full_span, ..
             } => {
-                let has_newline = full_span.last().copied() == Some(b'\n');
+                let has_newline = full_span.len() > content.len();
                 self.content = IOChunkContent::new_owned(content.to_vec(), has_newline);
                 self.utf8_verified.set(false);
                 Ok(())
@@ -545,6 +545,17 @@ impl<'a> LineReader<'a> {
         }
     }
 
+    /// Split records at `delimiter` from now on: NUL with `-z`, else newline (the default).
+    pub fn set_delimiter(&mut self, delimiter: u8) {
+        match self {
+            #[cfg(unix)]
+            LineReader::MmapInput { cursor, .. } => cursor.delimiter = delimiter,
+            LineReader::ReadInput(cursor) => cursor.delimiter = delimiter,
+            #[cfg(not(unix))]
+            LineReader::_Phantom(_) => unreachable!("_Phantom should never be constructed"),
+        }
+    }
+
     /// Return true if the previously returned line was the last one.
     pub fn last_line(&mut self) -> io::Result<bool> {
         match self {
@@ -717,8 +728,10 @@ impl OutputBuffer {
         )))
     }
 
-    /// Copy the specified file to the output.
+    /// Copy the specified file to the output, after a deferred newline if one is pending:
+    /// GNU sed writes that one even when the file is missing or empty.
     pub fn copy_file(&mut self, path: &PathBuf) -> io::Result<()> {
+        self.flush_pending_newline()?;
         // Flush mmap writes, if any.
         #[cfg(unix)]
         {
@@ -877,6 +890,14 @@ impl OutputBuffer {
         Ok(())
     }
 
+    /// Write `bytes` exactly as they are, after a deferred newline if one is pending. The
+    /// next output follows them directly, whether or not they end with a newline.
+    pub fn write_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.flush_pending_newline()?;
+        self.flush_mmap(WriteRange::Complete)?;
+        self.out.write_all(bytes)
+    }
+
     /// Write a deferred newline if the last output didn't end with one.
     pub fn flush_pending_newline(&mut self) -> io::Result<()> {
         if self.pending_newline {
@@ -921,6 +942,13 @@ impl OutputBuffer {
                 Ok(())
             }
         }
+    }
+
+    /// Write `bytes` exactly as they are, after a deferred newline if one is pending. The
+    /// next output follows them directly, whether or not they end with a newline.
+    pub fn write_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.flush_pending_newline()?;
+        self.out.write_all(bytes)
     }
 
     /// Write a deferred newline if the last output didn't end with one.
@@ -2033,7 +2061,8 @@ mod tests {
                     block_size: 1,
                 },
                 base: bytes.as_ptr(),
-                content: bytes,
+                // As `MmapLineCursor::get_line` returns it: the content without its terminator.
+                content: bytes.strip_suffix(b"\n").unwrap_or(bytes),
                 full_span: bytes,
             },
         }

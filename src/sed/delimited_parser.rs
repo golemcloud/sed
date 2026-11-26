@@ -126,16 +126,15 @@ pub enum EscapedChar {
 }
 
 /// The base of a reserved, 256-codepoint Unicode Private Use Area block sed's own parser uses
-/// to carry a numeric escape's raw byte value through a `CharacterMode::Utf8` transliteration
-/// operand, so the accumulated buffer stays valid UTF-8 (a Rust `String` cannot hold a byte like
-/// 0xFF on its own) while `Transliteration::insert` (`command.rs`) can still recover the exact
-/// byte GNU would have inserted. Real script text using this obscure PUA block for a `y///`
+/// to carry a byte that forms no UTF-8 character through a `CharacterMode::Utf8`
+/// transliteration operand, so the operand stays a `String` (which cannot hold a byte like
+/// 0xFF on its own) while `Transliteration` (`command.rs`) can still recover the exact byte. Real script text using this obscure PUA block for a `y///`
 /// operand character — or this fork's own `\uE0xx` escape landing in it — would collide; both
 /// are accepted, narrow limitations rather than something worth a second side channel for.
 const BYTE_MARKER_BASE: u32 = 0xE000;
 
 /// Encode `b` as this module's transliteration byte marker (see `BYTE_MARKER_BASE`).
-fn byte_marker(b: u8) -> char {
+pub(crate) fn byte_marker(b: u8) -> char {
     char::from_u32(BYTE_MARKER_BASE + u32::from(b)).expect("BYTE_MARKER_BASE + 0..=255 is valid")
 }
 
@@ -191,27 +190,6 @@ pub fn push_pattern_escaped_char(
     }
 }
 
-/// Append an escaped character for a `y///` operand: like the pattern context, the accumulated
-/// bytes are later re-checked as UTF-8 text in `CharacterMode::Utf8` (`parsed_bytes_to_utf8`),
-/// but unlike a pattern there is no regex engine downstream to interpret an inline escape — a
-/// `y///` operand is matched and substituted one character for one character. So a raw byte
-/// above ASCII is instead stood in for by this module's private-use marker character, which
-/// `Transliteration::insert` (`command.rs`) decodes back to the exact byte.
-pub fn push_transliteration_escaped_char(
-    bytes: &mut Vec<u8>,
-    escaped: EscapedChar,
-    character_mode: CharacterMode,
-) {
-    match escaped {
-        EscapedChar::Byte(b) if character_mode == CharacterMode::Utf8 && b > 0x7F => {
-            let mut buf = [0u8; 4];
-            bytes.extend_from_slice(byte_marker(b).encode_utf8(&mut buf).as_bytes());
-        }
-        EscapedChar::Byte(b) => bytes.push(b),
-        EscapedChar::Char(ch) => push_script_char(bytes, ch, character_mode),
-    }
-}
-
 /// Append an escaped character for a bracket expression's own content (inside the `[...]`,
 /// not the surrounding pattern). Verified against the real oracle: unlike everywhere else, a
 /// `\dNNN`/`\oNNN`/`\xHH` byte escape above ASCII contributes *nothing at all* to a bracket
@@ -231,19 +209,6 @@ fn push_class_escaped_char(
         EscapedChar::Byte(b) => bytes.push(b),
         EscapedChar::Char(ch) => push_script_char(bytes, ch, character_mode),
     }
-}
-
-/// Decode parsed script bytes as UTF-8 for character-mode parsing.
-fn parsed_bytes_to_utf8(
-    lines: &ScriptLineProvider,
-    line: &ScriptCharProvider,
-    bytes: Vec<u8>,
-    description: &str,
-) -> UResult<String> {
-    String::from_utf8(bytes).map_err(|e| {
-        compilation_error::<String>(lines, line, format!("invalid UTF-8 in {description}: {e}"))
-            .unwrap_err()
-    })
 }
 
 /// Parse a character escape valid in all contexts (RE pattern, substitution,
@@ -359,6 +324,7 @@ fn parse_character_class(
     lines: &ScriptLineProvider,
     line: &mut ScriptCharProvider,
     character_mode: CharacterMode,
+    regex_mode: RegexMode,
 ) -> UResult<Vec<u8>> {
     let mut result = Vec::new();
 
@@ -440,9 +406,25 @@ fn parse_character_class(
                         line.advance();
                         if !line.eol() && line.current() == ']' {
                             line.advance();
-                            result.extend_from_slice(&inner);
-                            result.push(marker as u8);
-                            result.push(b']');
+                            // GNU's `[:alpha:]` is locale-aware, but the RE engine's own
+                            // POSIX classes are ASCII-only (`[[:alpha:]]` won't match "é"
+                            // even with Unicode on), so in a UTF-8 locale it becomes the
+                            // Unicode letter class, spelled for `bre_to_ere` in a BRE. In the C
+                            // locale GNU's is ASCII-only too.
+                            if marker == ':'
+                                && inner == b"alpha"
+                                && character_mode == CharacterMode::Utf8
+                            {
+                                result.truncate(result.len() - 2);
+                                result.extend_from_slice(match regex_mode {
+                                    RegexMode::Basic => br"\p\{Alphabetic\}",
+                                    RegexMode::Extended => br"\p{Alphabetic}",
+                                });
+                            } else {
+                                result.extend_from_slice(&inner);
+                                result.push(marker as u8);
+                                result.push(b']');
+                            }
                             terminated = true;
                             break;
                         }
@@ -464,10 +446,9 @@ fn parse_character_class(
 
                 continue;
             }
-            // Not a POSIX construct — treat as literal
-            result.push(b'[');
-            result.push(line.current_byte());
-            line.advance();
+            // Not a POSIX construct: a literal `[`, escaped for the RE engine, which would
+            // read it as a nested class. The character after it is an ordinary member.
+            result.extend_from_slice(br"\[");
             continue;
         }
 
@@ -477,12 +458,18 @@ fn parse_character_class(
             if line.eol() {
                 break;
             }
-            if let Some(decoded) = parse_char_escape(line) {
+            // GNU decodes `\\` and the character escapes here too, except `\b`. Any other
+            // backslash is a literal member, and the character after it is an ordinary member,
+            // so `[\<]` matches `\` and `<`, and `[\]` closes after the backslash.
+            if line.current() == '\\' {
+                result.extend_from_slice(br"\\");
+                line.advance();
+            } else if line.current() != 'b'
+                && let Some(decoded) = parse_char_escape(line)
+            {
                 push_class_escaped_char(&mut result, decoded, character_mode);
             } else {
-                result.push(b'\\');
-                result.push(line.current_byte());
-                line.advance();
+                result.extend_from_slice(br"\\");
             }
         } else {
             result.push(line.current_byte());
@@ -537,12 +524,17 @@ pub fn parse_regex_for_mode(
 ) -> UResult<Vec<u8>> {
     let delimiter = scan_delimiter(lines, line)?;
     let mut result = Vec::new();
-    // POSIX has no lazy quantifiers, so a `?`/`\?` stacked straight onto a quantifier
-    // that was just emitted (`a+?`, `a\{2,3\}\?`, a bare `*` followed by `?`, ...) is a
-    // no-op re-quantification in GNU, not Perl-style laziness — which is what it would
-    // read as if passed through unchanged, since the underlying RE engine (`regex`/
-    // `fancy_regex`) gives `+`/`*`/`?`/`{m,n}` their usual Rust-regex meaning either way.
+    // POSIX has no lazy quantifiers: a `?`/`\?` stacked straight onto a quantifier that was
+    // just emitted (`a+?`, `a\{2,3\}\?`, ...) makes the whole quantified atom optional, so
+    // GNU reads `X+?` as `(X+)?`, greedy. Passed through unchanged, the RE engine (`regex`/
+    // `fancy_regex`) would read it as Perl-style laziness instead, so the quantified atom is
+    // wrapped in a non-capturing group that the `?` then applies to.
     let mut just_quantified = false;
+    // Where in `result` the last complete atom starts, which a following quantifier repeats;
+    // `None` at the start of the pattern, a group or an alternative.
+    let mut atom_start: Option<usize> = None;
+    // Where in `result` each open group starts.
+    let mut group_starts: Vec<usize> = Vec::new();
     // Between a `{`/`\{` that opened a recognized `{m,n}` interval and its closing
     // `}`/`\}` — so that closing brace only counts as "just quantified" when it's really
     // closing one, not when it's a literal brace.
@@ -552,7 +544,8 @@ pub fn parse_regex_for_mode(
         just_quantified = false;
         match line.current() {
             '[' if delimiter != '[' => {
-                let cc = parse_character_class(lines, line, character_mode)?;
+                atom_start = Some(result.len());
+                let cc = parse_character_class(lines, line, character_mode, regex_mode)?;
                 result.extend_from_slice(&cc);
                 continue;
             }
@@ -562,9 +555,18 @@ pub fn parse_regex_for_mode(
             // before anything else, verified against the oracle (`s\a\b\` closes on the very
             // first `\` after each of "a" and "b", it doesn't read as an unterminated escape).
             '\\' if delimiter != '\\' => {
+                let start = result.len();
                 line.advance();
                 if line.eol() {
                     return compilation_error(lines, line, "unterminated regular expression");
+                }
+                let quantifier = match line.current() {
+                    '{' | '}' => true,
+                    '+' | '?' => !posix,
+                    _ => false,
+                };
+                if !(quantifier && matches!(regex_mode, RegexMode::Basic)) {
+                    atom_start = Some(start);
                 }
                 if line.current() == delimiter {
                     // Push escaped delimiter
@@ -599,18 +601,22 @@ pub fn parse_regex_for_mode(
                     }
                     continue;
                 }
-                if line.current() == '+' {
+                if line.current() == '+' && matches!(regex_mode, RegexMode::Basic) {
                     result.push(b'\\');
                     result.push(b'+');
                     line.advance();
                     just_quantified = true;
                     continue;
                 }
-                if line.current() == '?' {
-                    if !quantified {
+                if line.current() == '?' && matches!(regex_mode, RegexMode::Basic) {
+                    if quantified {
+                        if let Some(start) = atom_start {
+                            make_quantified_atom_optional(&mut result, start, regex_mode);
+                        }
+                    } else {
                         result.push(b'\\');
                         result.push(b'?');
-                    } // else: redundant — drop it rather than let it read as lazy.
+                    }
                     line.advance();
                     just_quantified = true;
                     continue;
@@ -619,25 +625,48 @@ pub fn parse_regex_for_mode(
                 // `\b` must reach the RE engine as a word-boundary assertion (`\x08` is
                 // spelled `\cH` or `\x08` in a GNU sed RE), and `\<`/`\>` (word start/end,
                 // which no supported RE engine spells natively) are translated into
-                // lookaround assertions built on `\w`.
+                // lookaround assertions built on `\w`, spelled for `bre_to_ere` in a BRE (see
+                // `push_pattern_escaped_char`).
                 if line.current() == 'b' {
                     result.extend_from_slice(br"\b");
                     line.advance();
                     continue;
                 }
-                if line.current() == '<' {
-                    result.extend_from_slice(br"(?<!\w)(?=\w)");
+                if line.current() == '<' || line.current() == '>' {
+                    let assertion: &[u8] = match (line.current(), regex_mode) {
+                        ('<', RegexMode::Basic) => br"\(\?<!\w\)\(\?=\w\)",
+                        ('<', RegexMode::Extended) => br"(?<!\w)(?=\w)",
+                        (_, RegexMode::Basic) => br"\(\?<=\w\)\(\?!\w\)",
+                        (_, RegexMode::Extended) => br"(?<=\w)(?!\w)",
+                    };
+                    result.extend_from_slice(assertion);
                     line.advance();
-                    continue;
-                }
-                if line.current() == '>' {
-                    result.extend_from_slice(br"(?<=\w)(?!\w)");
-                    line.advance();
+                    // In a BRE, a `*` with nothing to repeat is a literal `*`, and an
+                    // assertion leaves nothing to repeat.
+                    if matches!(regex_mode, RegexMode::Basic)
+                        && delimiter != '*'
+                        && !line.eol()
+                        && line.current() == '*'
+                    {
+                        result.extend_from_slice(br"\*");
+                        line.advance();
+                    }
                     continue;
                 }
                 if let Some(decoded) = parse_char_escape(line) {
                     push_pattern_escaped_char(&mut result, decoded, character_mode, regex_mode);
                 } else {
+                    if matches!(regex_mode, RegexMode::Basic) {
+                        match line.current() {
+                            '(' => {
+                                group_starts.push(start);
+                                atom_start = None;
+                            }
+                            ')' => atom_start = group_starts.pop(),
+                            '|' => atom_start = None,
+                            _ => {}
+                        }
+                    }
                     // Pass through \<any> to RE engine for further treatment
                     result.push(b'\\');
                     result.push(line.current_byte());
@@ -654,6 +683,9 @@ pub fn parse_regex_for_mode(
                 continue;
             }
             '}' if delimiter != '}' => {
+                if !in_interval {
+                    atom_start = Some(result.len());
+                }
                 result.push(b'}');
                 line.advance();
                 if in_interval {
@@ -675,20 +707,51 @@ pub fn parse_regex_for_mode(
                 continue;
             }
             '?' if delimiter != '?' && matches!(regex_mode, RegexMode::Extended) => {
-                if !quantified {
+                if quantified {
+                    if let Some(start) = atom_start {
+                        make_quantified_atom_optional(&mut result, start, regex_mode);
+                    }
+                } else {
                     result.push(b'?');
-                } // else: redundant — drop it rather than let it read as lazy.
+                }
                 line.advance();
                 just_quantified = true;
                 continue;
             }
 
             c if c == delimiter => return Ok(result),
-            _ => result.push(line.current_byte()),
+            c => {
+                match (c, regex_mode) {
+                    ('(', RegexMode::Extended) => {
+                        group_starts.push(result.len());
+                        atom_start = None;
+                    }
+                    (')', RegexMode::Extended) => {
+                        atom_start = Some(group_starts.pop().unwrap_or(result.len()));
+                    }
+                    ('|', RegexMode::Extended) => atom_start = None,
+                    // A UTF-8 continuation byte belongs to the character it continues.
+                    _ if character_mode == CharacterMode::Utf8
+                        && (0x80..0xc0).contains(&line.current_byte()) => {}
+                    _ => atom_start = Some(result.len()),
+                }
+                result.push(line.current_byte());
+            }
         }
         line.advance();
     }
     compilation_error(lines, line, "unterminated regular expression")
+}
+
+/// Make the quantified atom at `start` in `result` optional, as a `?` stacked on its
+/// quantifier does: `X+` becomes `(?:X+)?`, spelled for `bre_to_ere` in a BRE.
+fn make_quantified_atom_optional(result: &mut Vec<u8>, start: usize, regex_mode: RegexMode) {
+    let (open, close): (&[u8], &[u8]) = match regex_mode {
+        RegexMode::Basic => (br"\(\?:", br"\)\?"),
+        RegexMode::Extended => (b"(?:", b")?"),
+    };
+    result.splice(start..start, open.iter().copied());
+    result.extend_from_slice(close);
 }
 
 // Check for closing brace and the structure/content.
@@ -879,7 +942,7 @@ fn parse_transliteration_bytes(
                     continue;
                 }
                 if let Some(decoded) = parse_char_escape(line) {
-                    push_transliteration_escaped_char(&mut result, decoded, character_mode);
+                    push_escaped_char(&mut result, decoded, character_mode);
                 } else {
                     // Pass through \<any> to tr for literal use
                     result.push(b'\\');
@@ -905,8 +968,16 @@ pub fn parse_transliteration_for_mode(
     let bytes = parse_transliteration_bytes(lines, line, character_mode)?;
     match character_mode {
         CharacterMode::Byte => Ok(ParsedTransliteration::Bytes(bytes)),
-        CharacterMode::Utf8 => parsed_bytes_to_utf8(lines, line, bytes, "transliteration string")
-            .map(ParsedTransliteration::Text),
+        // As in GNU, the operand's bytes, from escapes or not, form characters, and a byte
+        // that forms none is one character of its own, carried as its marker.
+        CharacterMode::Utf8 => {
+            let mut text = String::with_capacity(bytes.len());
+            for chunk in bytes.utf8_chunks() {
+                text.push_str(chunk.valid());
+                text.extend(chunk.invalid().iter().map(|&b| byte_marker(b)));
+            }
+            Ok(ParsedTransliteration::Text(text))
+        }
     }
 }
 
@@ -927,22 +998,6 @@ mod tests {
     fn test_os_string_from_bytes_accepts_utf8() {
         let os = os_string_from_bytes("aé".as_bytes().to_vec()).unwrap();
         assert_eq!(os, OsString::from("aé"));
-    }
-
-    #[test]
-    fn test_parsed_bytes_to_utf8_accepts_valid_utf8() {
-        let lines = ScriptLineProvider::with_active_state("test.sed", 1);
-        let line = ScriptCharProvider::new("");
-        let text = parsed_bytes_to_utf8(&lines, &line, "é".as_bytes().to_vec(), "test").unwrap();
-        assert_eq!(text, "é");
-    }
-
-    #[test]
-    fn test_parsed_bytes_to_utf8_rejects_invalid_utf8() {
-        let lines = ScriptLineProvider::with_active_state("test.sed", 1);
-        let line = ScriptCharProvider::new("");
-        let err = parsed_bytes_to_utf8(&lines, &line, b"\xE9".to_vec(), "test").unwrap_err();
-        assert!(err.to_string().contains("invalid UTF-8 in test"));
     }
 
     fn make_providers(input: &str) -> (ScriptLineProvider, ScriptCharProvider) {
@@ -1261,7 +1316,9 @@ mod tests {
     fn test_basic_character_class() {
         let mut line = char_provider_from("[qr]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[qr]");
     }
 
@@ -1269,7 +1326,9 @@ mod tests {
     fn test_negated_class() {
         let mut line = char_provider_from("[^abc]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[^abc]");
     }
 
@@ -1277,7 +1336,9 @@ mod tests {
     fn test_leading_close_bracket() {
         let mut line = char_provider_from("[]abc]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[]abc]");
     }
 
@@ -1285,7 +1346,9 @@ mod tests {
     fn test_leading_negated_close_bracket() {
         let mut line = char_provider_from("[^]abc]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[^]abc]");
     }
 
@@ -1300,7 +1363,9 @@ mod tests {
     fn test_byte_escape_dropped_among_other_members() {
         let mut line = char_provider_from("[a\\xffb-d]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[ab-d]");
     }
 
@@ -1308,7 +1373,9 @@ mod tests {
     fn test_byte_escape_only_becomes_never_matches() {
         let mut line = char_provider_from("[\\xff]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, br"\b\B");
     }
 
@@ -1316,7 +1383,9 @@ mod tests {
     fn test_negated_byte_escape_only_becomes_matches_anything() {
         let mut line = char_provider_from("[^\\xff]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b".");
     }
 
@@ -1324,7 +1393,9 @@ mod tests {
     fn test_byte_escape_after_leading_close_bracket_keeps_the_literal() {
         let mut line = char_provider_from("[]\\xff]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[]]");
     }
 
@@ -1332,7 +1403,9 @@ mod tests {
     fn test_byte_escape_in_byte_mode_is_unaffected() {
         let mut line = char_provider_from("[\\xff]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Byte).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Byte, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[\xff]");
     }
 
@@ -1340,7 +1413,9 @@ mod tests {
     fn test_escaped_character_begin() {
         let mut line = char_provider_from("[\\nabc]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[\nabc]");
     }
 
@@ -1348,7 +1423,9 @@ mod tests {
     fn test_escaped_character_middle() {
         let mut line = char_provider_from("[a\\nbc]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[a\nbc]");
     }
 
@@ -1356,23 +1433,31 @@ mod tests {
     fn test_escaped_character_end() {
         let mut line = char_provider_from("[abc\\n]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[abc\n]");
     }
 
     #[test]
-    fn test_escaped_delimiter() {
+    // A backslash is a literal member, so the first `]` closes the bracket, as in GNU.
+    fn test_backslash_before_closing_bracket() {
         let mut line = char_provider_from("[a\\]bc]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
-        assert_eq!(result, br"[a\]bc]");
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
+        assert_eq!(result, br"[a\\]");
+        assert_eq!(line.current(), 'b');
     }
 
     #[test]
     fn test_posix_class() {
         let mut line = char_provider_from("[[:digit:]]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[[:digit:]]");
     }
 
@@ -1380,7 +1465,9 @@ mod tests {
     fn test_colon_literal_character_class() {
         let mut line = char_provider_from("[:]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[:]");
     }
 
@@ -1388,7 +1475,9 @@ mod tests {
     fn test_equivalence_class() {
         let mut line = char_provider_from("[[=a=]]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[[=a=]]");
     }
 
@@ -1396,7 +1485,9 @@ mod tests {
     fn test_collating_symbol() {
         let mut line = char_provider_from("[[.ch.]]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[[.ch.]]");
     }
 
@@ -1404,7 +1495,8 @@ mod tests {
     fn test_unterminated_class_error() {
         let mut line = char_provider_from("[abc"); // missing closing ]
         let lines = test_lines();
-        let err = parse_character_class(&lines, &mut line, CharacterMode::Utf8);
+        let err =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended);
         assert!(err.is_err());
     }
 
@@ -1412,7 +1504,9 @@ mod tests {
     fn test_open_bracket_at_eol_errors() {
         let mut line = char_provider_from("[");
         let lines = test_lines();
-        let err = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap_err();
+        let err =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap_err();
         assert!(err.to_string().contains("Unterminated bracket expression"));
     }
 
@@ -1420,7 +1514,8 @@ mod tests {
     fn test_unterminated_posix_class_error() {
         let mut line = char_provider_from("[[:digit:]");
         let lines = test_lines();
-        let err = parse_character_class(&lines, &mut line, CharacterMode::Utf8);
+        let err =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended);
         assert!(err.is_err());
     }
 
@@ -1428,7 +1523,8 @@ mod tests {
     fn test_unterminated_escape_error() {
         let mut line = char_provider_from("[abc\\"); // missing closing ]
         let lines = test_lines();
-        let err = parse_character_class(&lines, &mut line, CharacterMode::Utf8);
+        let err =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended);
         assert!(err.is_err());
     }
 
@@ -1436,16 +1532,20 @@ mod tests {
     fn test_malformed_posix_like_pattern_treated_as_literal() {
         let mut line = char_provider_from("[[x]yz]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
-        assert_eq!(result, b"[[x]");
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
+        assert_eq!(result, br"[\[x]");
     }
 
     #[test]
     fn test_literal_open_bracket_in_character_class() {
         let mut line = char_provider_from("[a[b]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
-        assert_eq!(result, b"[a[b]");
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
+        assert_eq!(result, br"[a\[b]");
     }
 
     // parse_regex
@@ -1512,29 +1612,28 @@ mod tests {
     }
 
     #[test]
-    // FB-067: `?` stacked onto a quantifier is a redundant no-op in GNU, not the lazy
-    // modifier it would read as if passed straight through to the RE engine.
-    fn test_extended_regex_drops_redundant_question_mark_after_quantifier() {
-        let (lines, mut line) = make_providers("/a+?/p");
-        assert_eq!(
-            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
-            b"a+"
-        );
-        let (lines, mut line) = make_providers("/a*?/p");
-        assert_eq!(
-            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
-            b"a*"
-        );
-        let (lines, mut line) = make_providers("/a??/p");
-        assert_eq!(
-            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
-            b"a?"
-        );
-        let (lines, mut line) = make_providers("/a{2,3}?/p");
-        assert_eq!(
-            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
-            b"a{2,3}"
-        );
+    // `?` stacked onto a quantifier makes the quantified atom optional in GNU (`X+?` is
+    // `(X+)?`), not the lazy modifier it would read as if passed straight through to the RE
+    // engine.
+    fn test_extended_regex_makes_quantified_atom_optional_for_stacked_question_mark() {
+        for (script, expected) in [
+            ("/a+?/p", &b"(?:a+)?"[..]),
+            ("/a*?/p", b"(?:a*)?"),
+            ("/a??/p", b"(?:a?)?"),
+            ("/a{2,3}?/p", b"(?:a{2,3})?"),
+            ("/xa+??/p", b"x(?:(?:a+)?)?"),
+            ("/x(ab)+?/p", b"x(?:(ab)+)?"),
+            ("/x[ab]+?/p", b"x(?:[ab]+)?"),
+            ("/x|a\\.+?/p", b"x|a(?:\\.+)?"),
+            ("/a\\++?/p", b"a(?:\\++)?"),
+        ] {
+            let (lines, mut line) = make_providers(script);
+            assert_eq!(
+                parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
+                expected,
+                "{script}"
+            );
+        }
         // A `?` that is NOT immediately after a quantifier stays a real quantifier.
         let (lines, mut line) = make_providers("/ab?/p");
         assert_eq!(
@@ -1544,17 +1643,56 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_regex_drops_redundant_question_mark_after_quantifier() {
-        let (lines, mut line) = make_providers(r"/a\+\?/p");
-        assert_eq!(
-            parse_regex(&lines, &mut line, RegexMode::Basic).unwrap(),
-            br"a\+"
-        );
-        let (lines, mut line) = make_providers(r"/a\{2,3\}\?/p");
-        assert_eq!(
-            parse_regex(&lines, &mut line, RegexMode::Basic).unwrap(),
-            br"a\{2,3\}"
-        );
+    fn test_alpha_class_becomes_unicode_letters_only_in_a_utf8_bracket_expression() {
+        for (script, regex_mode, character_mode, expected) in [
+            (
+                "/[[:alpha:]]/",
+                RegexMode::Extended,
+                CharacterMode::Utf8,
+                &br"[\p{Alphabetic}]"[..],
+            ),
+            (
+                "/[[:alpha:]]/",
+                RegexMode::Basic,
+                CharacterMode::Utf8,
+                br"[\p\{Alphabetic\}]",
+            ),
+            (
+                "/[[:alpha:]]/",
+                RegexMode::Extended,
+                CharacterMode::Byte,
+                b"[[:alpha:]]",
+            ),
+            (
+                r"/\[:alpha:]/",
+                RegexMode::Extended,
+                CharacterMode::Utf8,
+                br"\[:alpha:]",
+            ),
+        ] {
+            let (lines, mut line) = make_providers(script);
+            assert_eq!(
+                parse_regex_for_mode(&lines, &mut line, regex_mode, character_mode, false).unwrap(),
+                expected,
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_basic_regex_makes_quantified_atom_optional_for_stacked_question_mark() {
+        for (script, expected) in [
+            (r"/a\+\?/p", &br"\(\?:a\+\)\?"[..]),
+            (r"/a\{2,3\}\?/p", br"\(\?:a\{2,3\}\)\?"),
+            (r"/x\(ab\)*\?/p", br"x\(\?:\(ab\)*\)\?"),
+        ] {
+            let (lines, mut line) = make_providers(script);
+            assert_eq!(
+                parse_regex(&lines, &mut line, RegexMode::Basic).unwrap(),
+                expected,
+                "{script}"
+            );
+        }
     }
 
     #[test]
@@ -1652,10 +1790,10 @@ mod tests {
     }
 
     #[test]
-    fn test_regex_with_escaped_bracket_in_character_class() {
+    fn test_regex_with_backslash_before_closing_bracket() {
         let (lines, mut line) = make_providers("/[a\\]z]/");
         let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-        assert_eq!(parsed, br"[a\]z]");
+        assert_eq!(parsed, br"[a\\]z]");
         assert_eq!(line.current(), '/');
     }
 
@@ -1880,8 +2018,8 @@ mod tests {
     #[test]
     fn test_parse_transliteration_for_mode_utf8() {
         // `\xE9` is GNU's byte escape (raw byte 0xE9), not the Unicode character 'é' (U+00E9):
-        // it comes back as this module's private-use marker for that byte (see
-        // `push_transliteration_escaped_char`/`byte_from_marker`), not the character itself.
+        // alone it forms no character, so it comes back as this module's private-use marker
+        // for that byte (see `byte_marker`), not the character itself.
         let (lines, mut line) = make_providers("/a\\xE9/");
         let parsed =
             parse_transliteration_for_mode(&lines, &mut line, CharacterMode::Utf8).unwrap();
@@ -1890,6 +2028,13 @@ mod tests {
             ParsedTransliteration::Text(format!("a{}", byte_marker(0xE9)))
         );
         assert_eq!(line.current(), '/');
+        let (lines, mut line) = make_providers("/\\xc3\\xa9\\xc3/");
+        let parsed =
+            parse_transliteration_for_mode(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        assert_eq!(
+            parsed,
+            ParsedTransliteration::Text(format!("é{}", byte_marker(0xc3)))
+        );
     }
 
     #[test]

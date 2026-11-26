@@ -22,6 +22,7 @@ use crate::sed::named_writer;
 use memchr::memchr;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
@@ -79,13 +80,9 @@ fn match_address(
 
         Address::Line(lineno) => Ok(context.line_number == *lineno),
 
-        // Recognize "$" as the last line of last file. This is consistent
-        // with the original 7th Research Edition implementation:
-        // https://github.com/dspinellis/unix-history-repo/blob/Research-V7/usr/src/cmd/sed/sed1.c#L665
-        // The FreeBSD version checked for subsequent empty files, but this
-        // can lead to destructive reads (e.g. from named pipes),
-        // and is probably an overkill.
-        Address::Last => Ok(reader.last_line()? && (context.last_file || context.separate)),
+        // "$" is the last line of the input: of each file with `-s` or `-i`, else of the
+        // last operand that has one, as GNU sed reads ahead past empty and unreadable ones.
+        Address::Last => Ok(reader.last_line()?),
 
         _ => panic!("invalid address type in match_address"),
     }
@@ -327,6 +324,7 @@ fn substitute(
     output: &mut OutputBuffer,
 ) -> UResult<()> {
     let sub = extract_variant!(command, Substitution);
+    let mode = context.character_mode;
 
     let mut count = 0;
     let mut last_end = 0;
@@ -347,7 +345,7 @@ fn substitute(
                 Ok(Some(m)) => {
                     result.extend_from_slice(&text[last_end..m.start()]);
 
-                    let replacement = sub.replacement.apply_match(&m);
+                    let replacement = sub.replacement.apply_match(&m, mode);
                     result.extend_from_slice(&replacement);
                     replaced = true;
                     last_end = m.end();
@@ -365,7 +363,7 @@ fn substitute(
                     let m = caps.get(0)?.unwrap();
                     result.extend_from_slice(&text[last_end..m.start()]);
 
-                    let replacement = sub.replacement.apply_captures(command, &caps)?;
+                    let replacement = sub.replacement.apply_captures(command, &caps, mode)?;
                     result.extend_from_slice(&replacement);
                     replaced = true;
                     last_end = m.end();
@@ -395,7 +393,7 @@ fn substitute(
                         || count == sub.occurrence
                         || (sub.global && count > sub.occurrence)
                     {
-                        let replacement = sub.replacement.apply_captures(command, &caps)?;
+                        let replacement = sub.replacement.apply_captures(command, &caps, mode)?;
                         result.extend_from_slice(&replacement);
                         replaced = true;
                     } else {
@@ -445,6 +443,7 @@ fn substitute(
             write_named(
                 writer,
                 output,
+                context,
                 pattern.as_bytes(),
                 pattern.is_newline_terminated(),
             )?;
@@ -456,24 +455,32 @@ fn substitute(
 }
 
 /// Writes a `w` line to its file or, for `/dev/stdout`, to sed's own output as GNU sed does.
+/// Under `-i`, sed's own output is the edited file, so `/dev/stdout` is the real standard
+/// output. A terminated line ends with the record delimiter, NUL under `-z`.
 fn write_named(
     writer: &RefCell<crate::sed::named_writer::NamedWriter>,
     output: &mut OutputBuffer,
+    context: &ProcessingContext,
     line: &[u8],
     newline: bool,
 ) -> UResult<()> {
+    let delimiter = if context.null_data { b'\0' } else { b'\n' };
     if writer.borrow().is_standard_output() {
+        if context.in_place {
+            return named_writer::write_in_place_standard_output(line, newline, delimiter);
+        }
         output.write_chunk(&IOChunk::from_bytes(line.to_vec(), newline))?;
         return Ok(());
     }
-    writer.borrow_mut().write_line_bytes(line, newline)
+    writer
+        .borrow_mut()
+        .write_line_bytes(line, newline, delimiter)
 }
 
 /// Apply the specified transliteration in the provided pattern space.
 fn transliterate(
     pattern: &mut IOChunk,
     trans: &Transliteration,
-    location: &ScriptLocation,
     context: &ProcessingContext,
 ) -> UResult<()> {
     if context.character_mode == CharacterMode::Byte || trans.is_byte_identity {
@@ -496,29 +503,10 @@ fn transliterate(
         return Ok(());
     }
 
-    let text = pattern.as_str().map_err(|e| {
-        input_runtime_error::<()>(
-            location,
-            context,
-            format!("failed to decode pattern space as UTF-8 for transliteration: {e}"),
-        )
-        .unwrap_err()
-    })?;
-    let mut result = String::with_capacity(text.len());
-    let mut replaced = false;
-
-    // Perform the transliteration.
-    for ch in text.chars() {
-        let mapped = trans.lookup_char(ch);
-        if mapped != ch {
-            replaced = true;
-        }
-        result.push(mapped);
-    }
-
-    // Lazy replace.
-    if replaced {
-        pattern.set_to_string(result, pattern.is_newline_terminated());
+    let text = pattern.as_bytes();
+    let mut result = Vec::with_capacity(text.len());
+    if trans.apply_utf8(text, &mut result) {
+        pattern.set_to_bytes(result, pattern.is_newline_terminated());
     }
 
     Ok(())
@@ -530,6 +518,9 @@ fn flush_appends(output: &mut OutputBuffer, context: &mut ProcessingContext) -> 
         match elem {
             AppendElement::Text(text) => {
                 output.write_bytes(text.as_ref())?;
+            }
+            AppendElement::Line(line) => {
+                output.write_raw(line)?;
             }
             AppendElement::Path(path) => {
                 output.copy_file(path)?;
@@ -548,6 +539,7 @@ fn readable_ascii_byte(byte: u8) -> Cow<'static, str> {
         b'\x0b' => Cow::Borrowed(r"\v"),
         b'\x0c' => Cow::Borrowed(r"\f"),
         b'\\' => Cow::Borrowed(r"\\"),
+        b'\n' => Cow::Borrowed(r"\n"),
         b'\r' => Cow::Borrowed(r"\r"),
         b'\t' => Cow::Borrowed(r"\t"),
         b if b.is_ascii_control() => Cow::Owned(format!("\\{byte:03o}")),
@@ -585,25 +577,17 @@ impl ListLine {
         }
     }
 
-    /// Write a rendered list item, folding before the item if needed.
+    /// Write a rendered list item, folding before the item if needed. A maximum width of 0
+    /// means no folding.
     fn write_item(&mut self, output: &mut OutputBuffer, out_str: &str) -> UResult<()> {
         let out_len = out_str.len();
-        if self.width + out_len + 1 > self.max_width {
+        if self.max_width != 0 && self.width + out_len + 1 > self.max_width {
             self.buffer.push_str("\\\n");
             output.write_str(std::mem::take(&mut self.buffer))?;
             self.width = 0;
         }
         self.buffer.push_str(out_str);
         self.width += out_len;
-        Ok(())
-    }
-
-    /// Write the current list line with an embedded newline marker.
-    fn write_embedded_newline(&mut self, output: &mut OutputBuffer) -> UResult<()> {
-        self.buffer.push_str("$\n");
-        output.write_str(&self.buffer)?;
-        self.buffer.clear();
-        self.width = 0;
         Ok(())
     }
 
@@ -640,10 +624,6 @@ fn list(
     if !context.uutil_extensions || context.character_mode == CharacterMode::Byte {
         // List non-ASCII bytes in octal.
         for &byte in line.as_bytes() {
-            if byte == b'\n' {
-                list_line.write_embedded_newline(output)?;
-                continue;
-            }
             let out_str = readable_ascii_byte(byte);
             list_line.write_item(output, &out_str)?;
         }
@@ -658,10 +638,6 @@ fn list(
             .unwrap_err()
         })?;
         for ch in line.chars() {
-            if ch == '\n' {
-                list_line.write_embedded_newline(output)?;
-                continue;
-            }
             let out_str = readable_char(ch);
             list_line.write_item(output, &out_str)?;
         }
@@ -699,33 +675,116 @@ pub(crate) fn process_address_0(
     Ok(())
 }
 
+/// The input operands after the one being read, with their position among all operands. A
+/// later operand is opened when its turn comes, or earlier when the script asks whether the
+/// current line is the last one.
+struct LaterFiles {
+    opened: VecDeque<(usize, PathBuf, LineReader<'static>)>,
+    unopened: VecDeque<(usize, PathBuf)>,
+    delimiter: u8,
+}
+
+impl LaterFiles {
+    /// Open `path` for reading, or report it as GNU sed does and return `None`.
+    fn open(path: &PathBuf, delimiter: u8) -> Option<LineReader<'static>> {
+        match LineReader::open(path) {
+            Ok(mut reader) => {
+                reader.set_delimiter(delimiter);
+                Some(reader)
+            }
+            Err(error) => {
+                // Under wasm32-wasip2, `io::Error`'s own `Display` appends a
+                // "(os error N)" suffix GNU's own message never has.
+                let text = error.to_string();
+                let text = text.find(" (os error ").map_or(&*text, |i| &text[..i]);
+                eprintln!("sed: can't read {}: {text}", path.display());
+                set_exit_code(2);
+                None
+            }
+        }
+    }
+
+    /// The next operand that can be read, after reporting those that cannot.
+    fn next(&mut self) -> Option<(usize, PathBuf, LineReader<'static>)> {
+        if let Some(file) = self.opened.pop_front() {
+            return Some(file);
+        }
+        while let Some((index, path)) = self.unopened.pop_front() {
+            if let Some(reader) = Self::open(&path, self.delimiter) {
+                return Some((index, path, reader));
+            }
+        }
+        None
+    }
+
+    /// Whether any later operand has a line to read.
+    fn have_data(&mut self) -> io::Result<bool> {
+        for (_, _, reader) in &mut self.opened {
+            // A reader that has returned no line yet is at its last line only when empty.
+            if !reader.last_line()? {
+                return Ok(true);
+            }
+        }
+        // An empty operand is closed rather than kept: it has no line to give, and keeping
+        // each one open could use up the descriptors that a later operand needs.
+        while let Some((index, path)) = self.unopened.pop_front() {
+            if let Some(mut reader) = Self::open(&path, self.delimiter)
+                && !reader.last_line()?
+            {
+                self.opened.push_back((index, path, reader));
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// The operand being read, and the ones after it.
+struct Input<'a> {
+    reader: &'a mut LineReader<'static>,
+    later: &'a mut LaterFiles,
+    separate: bool,
+}
+
+impl LastLine for Input<'_> {
+    /// With `-s` or `-i` each file's own last line; else the last line of the last operand
+    /// that has one.
+    fn last_line(&mut self) -> io::Result<bool> {
+        Ok(self.reader.last_line()? && (self.separate || !self.later.have_data()?))
+    }
+}
+
 #[allow(clippy::cognitive_complexity)]
 /// Process a single input file
 fn process_file(
     commands: Option<Rc<RefCell<Command>>>,
-    reader: &mut LineReader,
+    input: &mut Input,
     output: &mut OutputBuffer,
     context: &mut ProcessingContext,
 ) -> UResult<()> {
     process_address_0(commands.clone(), output)?;
 
     // Loop over the input lines as pattern space.
-    while let Some(pattern) = reader.get_line()? {
-        process_line(commands.clone(), pattern, reader, output, context)?;
+    while let Some(pattern) = input.reader.get_line()? {
+        process_line(commands.clone(), pattern, input, output, context)?;
         if context.stop_processing {
-            output.flush_pending_newline()?;
+            // `q` ends its line with a terminator; `n` quitting at the last line does not.
+            if context.quit_code.is_some() {
+                output.flush_pending_newline()?;
+            }
             break;
         }
     }
 
-    // Handle any N command remains.
+    // A separate file's last `n` or `N` ends with the file; only `N`'s pending line prints.
     if context.separate
-        && !context.quiet
         && let Some(InputAction {
-            prepend: Some(pending),
+            prepend,
             terminated,
             ..
         }) = context.input_action.take()
+        && !context.quiet
+        && let Some(pending) = prepend
     {
         // Preserve the input's own "last line has no terminator" property (FB-078/FA-077):
         // `write_chunk` (not `write_bytes`, which sniffs `bytes.ends_with(b"\n")` — wrong for
@@ -754,23 +813,14 @@ pub fn process_line(
     {
         context.line_number += 1;
         context.substitution_made = false;
-        // Whether this call is continuing a pending `n`/`N` from an earlier call, rather than
-        // starting a fresh cycle on a just-read line. `N`'s own EOF fallback (further down,
-        // and in `Engine::finish`/`process_all_files`'s "N command remains" handling) uses
-        // this: verified against the oracle, GNU only preserves a truly-final, unterminated
-        // input line's own missing newline when `N` reaches end of input on its very first,
-        // untouched attempt (`printf 'a' | sed 'N'` → no added newline). Once `N` has already
-        // joined a line once, a *later* `N` hitting end of input in the same cycle — reached
-        // through `D`'s restart-without-reading, in every case checked — gets one added
-        // regardless of the actual last line's own terminator (`printf 'a\nb' | sed 'N;D'` →
-        // `b\n`, even though `b` itself has no newline in the input).
-        let started_as_continuation = context.input_action.is_some();
+        // The record delimiter that `N`, `G` and `H` join with and `D`, `P` and `W` split at.
+        let delimiter = if context.null_data { b'\0' } else { b'\n' };
         // Set the script command from which to start.
         let mut current: Option<Rc<RefCell<Command>>> =
             if let Some(action) = context.input_action.take() {
                 if let Some(mut combined_lines) = action.prepend {
                     // Continue processing the `N` command.
-                    combined_lines.push(if context.null_data { b'\0' } else { b'\n' });
+                    combined_lines.push(delimiter);
                     combined_lines.extend_from_slice(pattern.as_bytes());
                     pattern.set_to_bytes(combined_lines, pattern.is_newline_terminated());
                 }
@@ -835,8 +885,8 @@ pub fn process_line(
                     break;
                 }
                 'D' => {
-                    // Delete up to \n and start a new cycle without new input.
-                    if let Some(pos) = memchr(b'\n', pattern.as_bytes()) {
+                    // Delete up to the delimiter and start a new cycle without new input.
+                    if let Some(pos) = memchr(delimiter, pattern.as_bytes()) {
                         let (s, _) = pattern.fields_mut()?;
                         s.drain(..=pos);
                         current.clone_from(&commands);
@@ -867,9 +917,9 @@ pub fn process_line(
                     pattern.set_to_bytes(context.hold.content.clone(), context.hold.has_newline);
                 }
                 'G' => {
-                    // Append to pattern \n followed by hold space contents.
+                    // Append to pattern the delimiter followed by hold space contents.
                     let (pat_content, pat_has_newline) = pattern.fields_mut()?;
-                    pat_content.push(b'\n');
+                    pat_content.push(delimiter);
                     pat_content.extend_from_slice(&context.hold.content);
                     *pat_has_newline = context.hold.has_newline;
                 }
@@ -879,8 +929,8 @@ pub fn process_line(
                     context.hold.has_newline = pattern.is_newline_terminated();
                 }
                 'H' => {
-                    // Append to hold \n followed by pattern space contents.
-                    context.hold.content.push(b'\n');
+                    // Append to hold the delimiter followed by pattern space contents.
+                    context.hold.content.push(delimiter);
                     context.hold.content.extend_from_slice(pattern.as_bytes());
                     context.hold.has_newline = pattern.is_newline_terminated();
                 }
@@ -919,8 +969,7 @@ pub fn process_line(
                     // to perform when the next line is read.
                     context.input_action = Some(InputAction {
                         next_command: command.next.clone(),
-                        // See `started_as_continuation`'s own comment above.
-                        terminated: pattern.is_newline_terminated() || started_as_continuation,
+                        terminated: pattern.is_newline_terminated(),
                         prepend: Some(pattern.as_bytes().to_vec()),
                     });
                     return Ok(());
@@ -930,8 +979,8 @@ pub fn process_line(
                 }
                 'P' => {
                     let line = pattern.as_bytes();
-                    if let Some(pos) = memchr(b'\n', line) {
-                        output.write_bytes(&line[..=pos])?;
+                    if let Some(pos) = memchr(delimiter, line) {
+                        output.write_chunk(&IOChunk::from_bytes(line[..pos].to_vec(), true))?;
                     } else {
                         write_chunk(output, context, &pattern)?;
                     }
@@ -967,10 +1016,9 @@ pub fn process_line(
                     // (the file vanishing mid-run, say) is treated the same as running out
                     // of lines: nothing is queued, same as GNU sed's "missing file" case.
                     let reader = extract_variant!(command, NamedReader);
-                    if let Ok(Some(line)) = reader.borrow_mut().next_line() {
-                        context
-                            .append_elements
-                            .push(AppendElement::Text(line.into()));
+                    let delimiter = if context.null_data { b'\0' } else { b'\n' };
+                    if let Ok(Some(line)) = reader.borrow_mut().next_line(delimiter) {
+                        context.append_elements.push(AppendElement::Line(line));
                     }
                 }
                 's' => {
@@ -1013,6 +1061,7 @@ pub fn process_line(
                     write_named(
                         writer,
                         output,
+                        context,
                         pattern.as_bytes(),
                         pattern.is_newline_terminated(),
                     )?;
@@ -1022,7 +1071,7 @@ pub fn process_line(
                     let writer = extract_variant!(command, NamedWriter);
                     let pattern_bytes = pattern.as_bytes();
                     let (first_line, found_newline) =
-                        match pattern_bytes.iter().position(|&b| b == b'\n') {
+                        match pattern_bytes.iter().position(|&b| b == delimiter) {
                             // A slice including the newline
                             Some(pos) => (&pattern_bytes[..=pos], true),
                             None => (pattern_bytes, false),
@@ -1030,6 +1079,7 @@ pub fn process_line(
                     write_named(
                         writer,
                         output,
+                        context,
                         first_line,
                         !found_newline && pattern.is_newline_terminated(),
                     )?;
@@ -1046,7 +1096,7 @@ pub fn process_line(
                 }
                 'y' => {
                     let trans = extract_variant!(command, Transliteration);
-                    transliterate(&mut pattern, trans, &command.location, context)?;
+                    transliterate(&mut pattern, trans, context)?;
                 }
                 'z' => {
                     // Clear the pattern contents, but preserve newline state
@@ -1116,26 +1166,18 @@ pub fn process_all_files(
 
     let mut in_place = InPlace::new(context.clone());
     let last_file_index = files.len() - 1;
+    // FA-082: GNU reports an unreadable file and keeps going — the remaining operands
+    // still get edited — rather than stopping the whole `-i`/`-s` run at the first one.
+    // Verified against the oracle: `sed -i 's/a/z/' nope a` reports
+    // `sed: can't read nope: No such file or directory`, edits `a`, and exits 2.
+    let mut later = LaterFiles {
+        opened: VecDeque::new(),
+        unopened: files.into_iter().enumerate().collect(),
+        delimiter: if context.null_data { b'\0' } else { b'\n' },
+    };
 
-    for (index, path) in files.into_iter().enumerate() {
+    while let Some((index, path, mut reader)) = later.next() {
         context.last_file = index == last_file_index;
-        // FA-082: GNU reports an unreadable file and keeps going — the remaining operands
-        // still get edited — rather than stopping the whole `-i`/`-s` run at the first one,
-        // which is what letting this propagate via `?` did (and left every later file
-        // untouched). Verified against the oracle: `sed -i 's/a/z/' nope a` reports
-        // `sed: can't read nope: No such file or directory`, edits `a`, and exits 2.
-        let mut reader = match LineReader::open(&path) {
-            Ok(reader) => reader,
-            Err(error) => {
-                // Under wasm32-wasip2, `io::Error`'s own `Display` appends a
-                // "(os error N)" suffix GNU's own message never has.
-                let text = error.to_string();
-                let text = text.find(" (os error ").map_or(&*text, |i| &text[..i]);
-                eprintln!("sed: can't read {}: {text}", path.display());
-                set_exit_code(2);
-                continue;
-            }
-        };
         let output = in_place.begin(&path)?;
 
         if context.separate || index == 0 {
@@ -1145,31 +1187,42 @@ pub fn process_all_files(
             // Reset hold space for separate file processing
             context.hold.content.clear();
             context.hold.has_newline = true;
+
+            for reader in &context.read_line_files {
+                reader.borrow_mut().restart();
+            }
         }
 
         context.input_name = path;
-        process_file(commands.clone(), &mut reader, output, context)?;
-
-        // Handle any N command remains.
-        if context.last_file
-            && !context.separate
-            && !context.quiet
-            && let Some(InputAction {
-                prepend: Some(pending),
-                terminated,
-                ..
-            }) = context.input_action.take()
-        {
-            // See the `context.separate` branch above for why `write_chunk`, not
-            // `write_bytes`, and why `terminated` rather than always appending one.
-            output.write_chunk(&IOChunk::from_bytes(pending, terminated))?;
-        }
+        let mut input = Input {
+            reader: &mut reader,
+            later: &mut later,
+            separate: context.separate,
+        };
+        process_file(commands.clone(), &mut input, output, context)?;
 
         in_place.end()?;
 
         if context.stop_processing {
             break;
         }
+    }
+
+    // Handle any N command remains once the last operand, readable or not, has had its turn.
+    if !context.separate
+        && !context.quiet
+        && let Some(InputAction {
+            prepend: Some(pending),
+            terminated,
+            ..
+        }) = context.input_action.take()
+    {
+        // See `process_file`'s `context.separate` branch for why `write_chunk`, not
+        // `write_bytes`, and why `terminated` rather than always appending one.
+        in_place
+            .output
+            .write_chunk(&IOChunk::from_bytes(pending, terminated))?;
+        in_place.output.flush()?;
     }
 
     // Flush all output files
@@ -1186,7 +1239,7 @@ mod tests {
 
     #[test]
     fn test_readable_ascii_byte_named_escapes() {
-        assert_eq!(readable_ascii_byte(b'\n'), r"\012");
+        assert_eq!(readable_ascii_byte(b'\n'), r"\n");
         assert_eq!(readable_ascii_byte(b'\t'), r"\t");
         assert_eq!(readable_ascii_byte(b'\\'), r"\\");
     }

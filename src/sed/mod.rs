@@ -370,6 +370,7 @@ fn build_context(matches: &ArgMatches) -> UResult<ProcessingContext> {
         range_commands: Vec::new(),
         substitution_made: false,
         append_elements: Vec::new(),
+        read_line_files: Vec::new(),
     })
 }
 

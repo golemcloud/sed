@@ -146,7 +146,10 @@ impl Engine {
             &mut self.context,
         )?;
         let flow = if self.context.stop_processing {
-            self.output.flush_pending_newline()?;
+            // `q` ends its line with a terminator; `n` quitting at the last line does not.
+            if self.context.quit_code.is_some() {
+                self.output.flush_pending_newline()?;
+            }
             Flow::Quit
         } else {
             Flow::Continue
@@ -237,7 +240,9 @@ mod tests {
             .collect();
         let (mut engine, _) = Engine::new(argv.into_iter()).unwrap();
         let mut out = Vec::new();
-        let lines: Vec<&str> = input.split_inclusive('\n').collect();
+        let lines: Vec<&str> = input
+            .split_inclusive(char::from(engine.delimiter()))
+            .collect();
         for (index, line) in lines.iter().enumerate() {
             let last = index + 1 == lines.len();
             if engine.record(line.as_bytes(), last, &mut out).unwrap() == Flow::Quit {
@@ -260,6 +265,27 @@ mod tests {
         assert_eq!(run(&["-n", "h;n;G;p"], "a\nb\nc\n").0, "b\na\n");
         assert_eq!(run(&["$!N;s/\\n/+/"], "a\nb\nc\n").0, "a+b\nc\n");
         assert_eq!(run(&["N;s/\\n/+/"], "a\nb\nc\n").0, "a+b\nc\n");
+    }
+
+    #[test]
+    fn null_data_commands_split_at_nul() {
+        assert_eq!(run(&["-z", "N;D"], "a\0b\0").0, "b\0");
+        assert_eq!(run(&["-z", "N;P;D"], "a\nb\0c\0").0, "a\nb\0c\0");
+        assert_eq!(run(&["-z", "$!N;D"], "a\nb\0c\0").0, "");
+        assert_eq!(run(&["-z", "H;$!d;x"], "a\0b\0c\0").0, "\0a\0b\0c\0");
+        assert_eq!(run(&["-z", "G"], "a\0b\0").0, "a\0\0b\0\0");
+        assert_eq!(run(&["-z", "x;G"], "a\0b\0").0, "\0a\0a\0b\0");
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let script = format!("N;W {}", file.path().display());
+        assert_eq!(run(&["-n", "-z", &script], "a\0b\0").0, "");
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"a\0");
+    }
+
+    #[test]
+    fn unterminated_last_line_stays_unterminated() {
+        assert_eq!(run(&["n"], "a\nb\nc").0, "a\nb\nc");
+        assert_eq!(run(&["N;D"], "a\nb").0, "b");
+        assert_eq!(run(&["q"], "a").0, "a\n");
     }
 
     #[test]

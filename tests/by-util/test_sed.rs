@@ -1324,18 +1324,6 @@ fn n_at_true_eof_does_not_add_a_missing_terminator() {
         .stdout_is_bytes(b"a\n");
 }
 
-/// Once `N` has already joined a line, a *later* `N` reaching end of input in the same cycle
-/// (reached through `D`'s restart-without-reading) gets a terminator added regardless of the
-/// actual last line's own — a genuine GNU quirk, verified against the oracle both ways.
-#[test]
-fn n_at_eof_after_d_restart_adds_a_terminator_even_when_the_last_line_lacks_one() {
-    new_ucmd!()
-        .args(&["-e", "N", "-e", "D"])
-        .pipe_in(b"a\nb".to_vec())
-        .succeeds()
-        .stdout_is_bytes(b"b\n");
-}
-
 /// `-s` inserts the record terminator between two file operands when the first one's last
 /// line lacked one, carrying `pending_newline` across `InPlace::begin`'s per-file
 /// `OutputBuffer` (FB-078/FA-077's `-s`-interaction discovery) — `N` reaches true end of
@@ -1355,6 +1343,50 @@ fn n_at_eof_terminator_carries_across_file_operands_with_separate() {
         .arg(dir.path().join("f2"))
         .succeeds()
         .stdout_is_bytes(b"a\nb");
+}
+
+/// A line without a terminator gets one only before the next output, also when that output
+/// comes from the next file operand, so only output that ends the run can lack one. Verified
+/// against the oracle.
+#[test]
+#[cfg(unix)]
+fn unterminated_file_ends_its_line_before_the_next_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let nl = dir.path().join("nl");
+    let b = dir.path().join("b");
+    let empty = dir.path().join("empty");
+    std::fs::write(&nl, b"x").unwrap();
+    std::fs::write(&b, b"4\n5\n").unwrap();
+    std::fs::write(&empty, b"").unwrap();
+    for (args, expected) in [
+        (vec![String::new()], &b"x\n4\n5\n"[..]),
+        (vec!["-n".into(), "p".into()], b"x\n4\n5\n"),
+        (vec!["N;N".into()], b"x\n4\n5\n"),
+        (vec!["l".into()], b"x$\nx\n4$\n4\n5$\n5\n"),
+        (vec!["-n".into(), "1p".into()], b"x"),
+        (vec!["1!G;h;$!d".into()], b"5\n4\nx"),
+    ] {
+        new_ucmd!()
+            .args(&args)
+            .arg(&nl)
+            .arg(&empty)
+            .arg(&b)
+            .succeeds()
+            .stdout_is_bytes(expected);
+    }
+    new_ucmd!()
+        .args(&["-z", ""])
+        .arg(&nl)
+        .arg(&b)
+        .succeeds()
+        .stdout_is_bytes(b"x\x004\n5\n");
+    new_ucmd!()
+        .arg("")
+        .arg(&b)
+        .arg(&nl)
+        .arg(&empty)
+        .succeeds()
+        .stdout_is_bytes(b"4\n5\nx");
 }
 
 /// Without `-s`, two file operands form one continuous stream: `N` reads straight across the
@@ -1377,9 +1409,477 @@ fn n_joins_across_file_operands_without_separate() {
         .stdout_is_bytes(b"a\nb");
 }
 
-/// Reject raw invalid UTF-8 transliteration script bytes in UTF-8 mode.
+/// Case conversion follows GNU 4.9. In the C locale it cases ASCII letters, leaves other ASCII
+/// bytes, and writes `\xff` for each byte above ASCII it converts; bytes outside a conversion
+/// stay. In a UTF-8 locale it converts valid characters one at a time, and invalid UTF-8 stays
+/// as it is while still using up a `\u`. Verified against the oracle.
 #[test]
-fn trans_raw_invalid_script_byte_rejected_in_c_utf8_locale() {
+fn case_conversion_follows_the_locale() {
+    for (locale, script, input, expected) in [
+        (
+            "C",
+            r"s/.*/\U&/",
+            &b"\xffa\xe9b\n"[..],
+            &b"\xffA\xffB\n"[..],
+        ),
+        ("C", r"s/.*/\U&/", "éa\n".as_bytes(), b"\xff\xffA\n"),
+        ("C", r"s/.*/\U&/", b"a!0\x7f\n", b"A!0\x7f\n"),
+        ("C", r"s/.*/\u&/", b"\xffab\n", b"\xffab\n"),
+        ("C", r"s/.*/\l&/", b"\x80A\n", b"\xffA\n"),
+        ("C", r"s/.*/\L&\E\x80/", b"A\xe9\n", b"a\xff\x80\n"),
+        ("C.UTF-8", r"s/a/\U\xff&\xe9/", b"a\n", b"\xffA\xe9\n"),
+        ("C.UTF-8", r"s/a/\u\xff&/", b"a\n", b"\xffa\n"),
+        (
+            "C.UTF-8",
+            r"s/.*/\U&/",
+            "éa\n".as_bytes(),
+            "ÉA\n".as_bytes(),
+        ),
+        (
+            "C.UTF-8",
+            r"s/.*/\L&/",
+            "ΣΑΣ ΑΣ\n".as_bytes(),
+            "σασ ασ\n".as_bytes(),
+        ),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", locale)
+            .arg(script)
+            .pipe_in(input.to_vec())
+            .succeeds()
+            .stdout_is_bytes(expected);
+    }
+}
+
+/// In a UTF-8 locale case conversion maps one character to one character: a character whose
+/// full mapping has more than one character keeps its simple mapping, or stays as it is when
+/// it has none. Verified against the oracle over every code point.
+#[test]
+fn case_conversion_maps_one_character_to_one_character() {
+    for (script, input, expected) in [
+        (r"s/.*/\U&/", "ßﬁŉǰ\n", "ßﬁŉǰ\n"),
+        (r"s/.*/\u&/", "ß\n", "ß\n"),
+        (r"s/.*/\L&/", "İ\n", "i\n"),
+        (r"s/.*/\l&/", "İX\n", "iX\n"),
+        (r"s/.*/\U&/", "ᾀᾗᾧᾳῃῳ\n", "ᾈᾟᾯᾼῌῼ\n"),
+        (r"s/.*/\L&/", "ᾈᾼ\n", "ᾀᾳ\n"),
+        (r"s/.*/\U&/", "éσ\n", "ÉΣ\n"),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .arg(script)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
+/// A `\L`, `\U` or `\E` cancels a pending `\u` or `\l`, while a `\u` or `\l` after `\U` or
+/// `\L` still converts the next character. Verified against the oracle.
+#[test]
+fn case_span_conversion_cancels_a_pending_next_character_conversion() {
+    for (locale, script, input, expected) in [
+        ("C.UTF-8", r"s/.*/\u\L&/", "hELLO\n", "hello\n"),
+        ("C", r"s/.*/\u\L&/", "hELLO\n", "hello\n"),
+        ("C.UTF-8", r"s/.*/\l\U&/", "hello\n", "HELLO\n"),
+        ("C.UTF-8", r"s/foo/\u\Ezap/", "foo\n", "zap\n"),
+        (
+            "C.UTF-8",
+            r"s/\(foo\) \(bar\)/\u\L\1 \U\2/",
+            "foo bar\n",
+            "foo BAR\n",
+        ),
+        ("C.UTF-8", r"s/\(x*\)\(ab\)/\u\1\L\2/", "ab\n", "ab\n"),
+        ("C.UTF-8", r"s/.*/\L\u&/", "hELLO\n", "Hello\n"),
+        ("C.UTF-8", r"s/.*/\U\l&/", "hello\n", "hELLO\n"),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", locale)
+            .arg(script)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
+/// A `?` or `\?` stacked on a quantifier makes the quantified atom optional, so `X+?` reads as
+/// `(X+)?`, greedy, in BREs and EREs alike. Verified against the oracle.
+#[test]
+fn question_mark_after_a_quantifier_makes_it_optional() {
+    for (args, input, expected) in [
+        (&["-E", "s/a+?/X/"][..], "b\n", "Xb\n"),
+        (&["-E", "s/a{2,3}?b/X/"], "ab\n", "aX\n"),
+        (&["-E", "s/a{2,3}?b/X/"], "aaab\n", "X\n"),
+        (&["-E", "s/a+?/X/g"], "aaab\n", "XbX\n"),
+        (&["-E", "s/(a)+??/X/2"], "aaab\n", "aaabX\n"),
+        (&["-E", "s/[a]+?/X/g"], "aaab\n", "XbX\n"),
+        (&["-E", "s/é+?/X/g"], "ééb\n", "XbX\n"),
+        (&["s/a\\+\\?/X/"], "b\n", "Xb\n"),
+        (&["s/a\\{2\\}\\?b/X/"], "ab\n", "aX\n"),
+        (&["s/\\(ab\\)\\{2\\}\\?c/X/"], "abc\n", "abX\n"),
+        (&["s/a*\\?/X/"], "aaab\n", "Xb\n"),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .args(args)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
+/// In a UTF-8 locale `[[:alpha:]]` matches any letter, while `[:alpha:]` after an escaped `[`
+/// is literal text. Verified against the oracle.
+#[test]
+fn alpha_class_is_unicode_only_inside_a_bracket_expression() {
+    for (args, input, expected) in [
+        (&[r"s/\[:alpha:]/X/"][..], "a[:alpha:]b\n", "aXb\n"),
+        (&["-E", r"s/\[:alpha:]/X/"], "a[:alpha:]b\n", "aXb\n"),
+        (&["s/[[:alpha:]]/X/g"], "aé1\n", "XX1\n"),
+        (&["s/[^[:alpha:]]/X/g"], "aé1\n", "aéX\n"),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .args(args)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
+/// Inside a bracket expression a backslash that starts no character escape is a literal
+/// backslash, and the character after it is an ordinary member: `[\<]` matches `\` and `<`,
+/// and `[\]` closes after the backslash. `\n` and the other character escapes except `\b`
+/// still work there. Verified against the oracle.
+#[test]
+fn backslash_in_a_bracket_expression_is_literal() {
+    for (args, input, expected) in [
+        (&[r"s/[\<]/X/g"][..], "a<\\b\n", "aXXb\n"),
+        (&["-E", r"s/[\>]/X/g"], "a>\\b\n", "aXXb\n"),
+        (&[r"s/[\b]/X/g"], "ab\\\n", "aXX\n"),
+        (&[r"s/[\w]/X/g"], "aw\\\n", "aXX\n"),
+        (&[r"s/[\]/X/g"], "a\\]\n", "aX]\n"),
+        (&[r"s/[^\^]/X/g"], "a\\^\n", "X\\^\n"),
+        (&[r"s/[\/]/X/g"], "a/\\\n", "aXX\n"),
+        (&[r"s/[\é]/X/g"], "é\\b\n", "XXb\n"),
+        (&[r"N;s/[\n]/X/"], "a\nb\n", "aXb\n"),
+        (&[r"s/[\t]/X/"], "a\tb\n", "aXb\n"),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .args(args)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
+/// A `[` inside a bracket expression that starts no `[:`, `[.` or `[=` is a literal member.
+/// Verified against the oracle.
+#[test]
+fn open_bracket_in_a_bracket_expression_is_literal() {
+    for (args, input, expected) in [
+        (&["s/[[]/X/g"][..], "a[b\n", "aXb\n"),
+        (&["s/[a[b]/X/g"], "a[bc\n", "XXXc\n"),
+        (&["-E", "s/[[a]/X/g"], "a[b\n", "XXb\n"),
+        (&[r"s/[\[]/X/g"], "a[\\b\n", "aXXb\n"),
+    ] {
+        new_ucmd!()
+            .args(args)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
+/// In a UTF-8 locale the bytes of a `y` operand, from escapes or not, form characters, and a
+/// byte that forms none maps only that byte where it forms no character in the input either.
+/// Verified against the oracle.
+#[test]
+fn transliteration_byte_escapes_form_characters_in_utf8() {
+    for (script, input, expected) in [
+        (r"y/\xc3/X/", &b"a\xc3\xa9b\n"[..], &b"a\xc3\xa9b\n"[..]),
+        (r"y/\xc3/X/", b"a\xc3b\n", b"aXb\n"),
+        (r"y/a\xc3/XY/", b"a\xc3\xa9b\xc3\n", b"X\xc3\xa9bY\n"),
+        (r"y/\xc3\xa9/X/", b"a\xc3\xa9b\n", b"aXb\n"),
+        (r"y/é/\xc3/", b"a\xc3\xa9b\n", b"a\xc3b\n"),
+        (r"y/\xc3/é/", b"a\xc3b\n", b"a\xc3\xa9b\n"),
+        (r"y/ab/\xc3\xa9Z/", b"ab\n", b"\xc3\xa9Z\n"),
+        (r"y/é/X/", b"a\xff\xc3\xa9\n", b"a\xffX\n"),
+        ("y/\u{ff}/Y/", b"\xc3\xbf\xff\n", b"Y\xff\n"),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .arg(script)
+            .pipe_in(input.to_vec())
+            .succeeds()
+            .stdout_is_bytes(expected);
+    }
+    for script in [r"y/\xc3\xa9/XY/", r"y/ab/\xc3\xa9/"] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .arg(script)
+            .pipe_in("ab\n")
+            .fails()
+            .code_is(1)
+            .stderr_contains("strings for `y' command are different lengths");
+    }
+}
+
+/// `\<` and `\>` match only at a word's start and end, in BREs and EREs alike. Verified
+/// against the oracle.
+#[test]
+fn word_start_and_end_match_in_basic_and_extended_regexes() {
+    for mode in [None, Some("-E")] {
+        for (input, script, expected) in [
+            ("xcat a cat\n", r"s/\<cat/X/g", "xcat a X\n"),
+            ("ab cd\n", r"s/\</X/g", "Xab Xcd\n"),
+            ("ab cd\n", r"s/\>/X/", "abX cd\n"),
+            ("xcat cat cats\n", r"s/\<cat\>/X/g", "xcat X cats\n"),
+        ] {
+            new_ucmd!()
+                .env("LC_ALL", "C.UTF-8")
+                .args(&mode.into_iter().chain([script]).collect::<Vec<_>>())
+                .pipe_in(input)
+                .succeeds()
+                .stdout_is(expected);
+        }
+    }
+    // In a BRE, a `*` after `\<` or `\>` has nothing to repeat and is a literal `*`.
+    for (script, expected) in [(r"s/\>*/X/", "fooXbar\n"), (r"s/\<*/X/", "foo*bar\n")] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .arg(script)
+            .pipe_in("foo*bar\n")
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
+/// Under `-z`, `w`, `W` and the `s///w` flag end each record they write with NUL, for file,
+/// pipe and `-i` input. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn null_data_write_commands_end_records_with_nul() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("o");
+    for (script, expected) in [("w", &b"a\0b\0"[..]), ("W", b"a\0b\0"), ("s/b/B/w", b"B\0")] {
+        new_ucmd!()
+            .arg("-z")
+            .arg("-n")
+            .arg(format!("{script} {}", out.display()))
+            .pipe_in(b"a\0b\0".to_vec())
+            .succeeds();
+        assert_eq!(std::fs::read(&out).unwrap(), expected, "{script}");
+    }
+    let f = dir.path().join("f");
+    std::fs::write(&f, b"a\0b\0").unwrap();
+    new_ucmd!()
+        .arg("-z")
+        .arg("-i")
+        .arg(format!("w {}", out.display()))
+        .arg(&f)
+        .succeeds();
+    assert_eq!(std::fs::read(&out).unwrap(), b"a\0b\0");
+    assert_eq!(std::fs::read(&f).unwrap(), b"a\0b\0");
+    new_ucmd!()
+        .arg("-n")
+        .arg(format!("w {}", out.display()))
+        .pipe_in("a\nb\n")
+        .succeeds();
+    assert_eq!(std::fs::read(&out).unwrap(), b"a\nb\n");
+}
+
+/// A `w` file line without a terminator gets one only before the file's next line, so only
+/// the file's last line can lack one, with or without `-s`, `-i` and `-z`. Verified against
+/// the oracle.
+#[test]
+#[cfg(unix)]
+fn write_file_defers_a_missing_terminator_to_its_next_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let nl = dir.path().join("nl");
+    let b = dir.path().join("b");
+    let out = dir.path().join("out");
+    for (args, expected) in [
+        (&["-n", "w"][..], &b"x\n4\n5\n"[..]),
+        (&["-n", "-s", "W"], b"x\n4\n5\n"),
+        (&["-i", "w"], b"x\n4\n5\n"),
+        (&["-n", "1w"], b"x"),
+        (&["-z", "-n", "w"], b"x\x004\n5\n"),
+    ] {
+        std::fs::write(&nl, b"x").unwrap();
+        std::fs::write(&b, b"4\n5\n").unwrap();
+        let (script, options) = args.split_last().unwrap();
+        new_ucmd!()
+            .args(options)
+            .arg(format!("{script} {}", out.display()))
+            .arg(&nl)
+            .arg(&b)
+            .succeeds();
+        assert_eq!(std::fs::read(&out).unwrap(), expected, "{args:?}");
+    }
+}
+
+/// Under `-i`, `w /dev/stdout`, `W /dev/stdout` and the `s///w /dev/stdout` flag write to the
+/// real standard output, not to the edited file. A missing terminator is written only before
+/// the next standard output line. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn in_place_write_to_dev_stdout_goes_to_standard_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let nl = dir.path().join("nl");
+    for (script, stdout, edited) in [
+        ("w /dev/stdout", &b"1\n2\n3\n"[..], &b"1\n2\n3\n"[..]),
+        ("s/2/X/w /dev/stdout", b"X\n", b"1\nX\n3\n"),
+        ("N;W /dev/stdout", b"1\n", b"1\n2\n3\n"),
+    ] {
+        std::fs::write(&a, b"1\n2\n3\n").unwrap();
+        new_ucmd!()
+            .args(&["-i", "-e", "1w /dev/stdout", "-e", script])
+            .arg(&a)
+            .succeeds()
+            .stdout_is_bytes([&b"1\n"[..], stdout].concat());
+        assert_eq!(std::fs::read(&a).unwrap(), edited, "{script}");
+    }
+    std::fs::write(&a, b"1\n2\n3\n").unwrap();
+    std::fs::write(&nl, b"x").unwrap();
+    new_ucmd!()
+        .args(&["-n", "-i", "w /dev/stdout"])
+        .arg(&nl)
+        .arg(&a)
+        .succeeds()
+        .stdout_is_bytes(b"x\n1\n2\n3\n");
+    std::fs::write(&nl, b"x").unwrap();
+    new_ucmd!()
+        .args(&["-i", "w /dev/stdout"])
+        .arg(&nl)
+        .succeeds()
+        .stdout_is_bytes(b"x");
+    assert_eq!(std::fs::read(&nl).unwrap(), b"x");
+}
+
+/// `-z` reads NUL-terminated records from files and pipes, with `-s` and `-i` too; a newline
+/// inside a record is ordinary data. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn null_data_splits_file_and_pipe_input_at_nul() {
+    let dir = tempfile::tempdir().unwrap();
+    let (f, g) = (dir.path().join("f"), dir.path().join("g"));
+    std::fs::write(&f, b"a\0b\nc\0d").unwrap();
+    std::fs::write(&g, b"e\0f\0").unwrap();
+    new_ucmd!()
+        .args(&["-z", "s/^/X/"])
+        .arg(&f)
+        .succeeds()
+        .stdout_is_bytes(b"Xa\0Xb\nc\0Xd");
+    new_ucmd!()
+        .args(&["-z", "s/^/X/"])
+        .pipe_in(b"a\0b\nc\0d".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"Xa\0Xb\nc\0Xd");
+    new_ucmd!()
+        .args(&["-z", "-s", "1d"])
+        .arg(&f)
+        .arg(&g)
+        .succeeds()
+        .stdout_is_bytes(b"b\nc\0d\0f\0");
+    new_ucmd!()
+        .args(&["-z", "-i", "1d"])
+        .arg(&f)
+        .arg(&g)
+        .succeeds()
+        .no_stdout();
+    assert_eq!(std::fs::read(&f).unwrap(), b"b\nc\0d");
+    assert_eq!(std::fs::read(&g).unwrap(), b"f\0");
+    std::fs::write(&f, b"a\nb\n").unwrap();
+    new_ucmd!()
+        .arg("s/^/X/")
+        .arg(&f)
+        .succeeds()
+        .stdout_is("Xa\nXb\n");
+}
+
+/// Output keeps a missing terminator on the last input line when `n` quits there or `N` finds
+/// no next line, also after `D` restarts the cycle, with or without `-z`. `q` still adds one.
+/// Verified against the oracle.
+#[test]
+fn unterminated_last_line_stays_unterminated_after_n_and_d() {
+    for (script, input, expected) in [
+        ("n", "a\nb\nc", "a\nb\nc"),
+        ("n;d", "a\nb\nc", "a\nc"),
+        ("n;p", "a", "a"),
+        ("N;D", "a\nb", "b"),
+        ("N;P;D", "a\nb\nc", "a\nb\nc"),
+        ("N;N;D", "a\nb\nc", "b\nc"),
+        ("N;D", "a\nb\n", "b\n"),
+        ("q", "a", "a\n"),
+    ] {
+        new_ucmd!()
+            .arg(script)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+        new_ucmd!()
+            .args(&["-z", script])
+            .pipe_in(input.replace('\n', "\0"))
+            .succeeds()
+            .stdout_is(expected.replace('\n', "\0"));
+    }
+}
+
+/// `l` shows a newline inside the pattern space as `\n`, with or without `-z`, and counts it
+/// toward the line width. Verified against the oracle.
+#[test]
+fn list_writes_embedded_newline_as_escape() {
+    new_ucmd!()
+        .args(&["-n", "N;l"])
+        .pipe_in("a\nb")
+        .succeeds()
+        .stdout_is("a\\nb$\n");
+    new_ucmd!()
+        .args(&["-n", "N;l 4"])
+        .pipe_in("ab\ncd\n")
+        .succeeds()
+        .stdout_is("ab\\\n\\nc\\\nd$\n");
+    new_ucmd!()
+        .args(&["-z", "-n", "N;l"])
+        .pipe_in(b"a\nb\0c\0".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"a\\nb\\000c$\0");
+}
+
+/// With `-s` or `-i`, an `n` or `N` at a file's last line ends there: under `-n` the next
+/// file starts its own script from the top. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn next_line_continuation_stops_at_separate_file_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (f1, f2) = (dir.path().join("f1"), dir.path().join("f2"));
+    for (script, expected) in [("n;p", "c\n"), ("N;p", "b\nc\n")] {
+        std::fs::write(&f1, b"a\n").unwrap();
+        std::fs::write(&f2, b"b\nc\n").unwrap();
+        new_ucmd!()
+            .args(&["-s", "-n", script])
+            .arg(&f1)
+            .arg(&f2)
+            .succeeds()
+            .stdout_is(expected);
+        new_ucmd!()
+            .args(&["-i", "-n", script])
+            .arg(&f1)
+            .arg(&f2)
+            .succeeds()
+            .no_stdout();
+        assert_eq!(std::fs::read(&f1).unwrap(), b"");
+        assert_eq!(std::fs::read_to_string(&f2).unwrap(), expected);
+    }
+}
+
+/// A raw script byte that forms no UTF-8 character is a `y` character of its own in UTF-8
+/// mode, as with its escape. Verified against the oracle.
+#[test]
+fn trans_raw_invalid_script_byte_maps_that_byte_in_c_utf8_locale() {
     let mut script = NamedTempFile::new().expect("create temporary sed script");
     script
         .write_all(b"y/\xE9/Z/")
@@ -1389,8 +1889,9 @@ fn trans_raw_invalid_script_byte_rejected_in_c_utf8_locale() {
     new_ucmd!()
         .env("LC_ALL", "C.UTF-8")
         .args(&["-f", script_path])
-        .fails()
-        .stderr_contains("invalid UTF-8 in transliteration string");
+        .pipe_in(b"a\xe9b\xc3\xa9\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"aZb\xc3\xa9\n");
 }
 
 #[test]
@@ -1519,7 +2020,7 @@ fn test_uppercase_delete_prevents_automatic_printing() {
         .args(&["-e", "N", "-e", "D"])
         .pipe_in("line1\nline2\nline3")
         .succeeds()
-        .stdout_is("line3\n");
+        .stdout_is("line3");
 }
 
 ////////////////////////////////////////////////////////////
@@ -2241,6 +2742,83 @@ fn in_place_edit_continues_past_an_unreadable_file() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Without `-s`, the last line is the last line of the last operand that has one: empty and
+/// unreadable operands after it do not hide it, and an unreadable one is still reported once.
+/// Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn last_line_looks_past_empty_and_unreadable_operands() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let empty = dir.path().join("empty");
+    let nope = dir.path().join("nope");
+    std::fs::write(&a, b"1\n2\n3\n").unwrap();
+    std::fs::write(&empty, b"").unwrap();
+    for (script, expected) in [
+        ("N", "1\n2\n3\n"),
+        ("$d", "1\n2\n"),
+        ("$!N;s/\\n/+/", "1+2\n3\n"),
+    ] {
+        let result = new_ucmd!().arg(script).arg(&a).arg(&nope).fails();
+        result.code_is(2);
+        result.stdout_is(expected);
+        result.stderr_is(format!(
+            "sed: can't read {}: No such file or directory\n",
+            nope.display()
+        ));
+    }
+    new_ucmd!()
+        .args(&["-n", "$p"])
+        .arg(&a)
+        .arg(&empty)
+        .arg(&empty)
+        .succeeds()
+        .stdout_is("3\n");
+    new_ucmd!()
+        .args(&["$a X"])
+        .arg(&a)
+        .arg(&empty)
+        .succeeds()
+        .stdout_is("1\n2\n3\nX\n");
+    let result = new_ucmd!()
+        .args(&["-n", "$="])
+        .arg(&a)
+        .arg(&nope)
+        .arg(&empty)
+        .fails();
+    result.code_is(2);
+    result.stdout_is("3\n");
+}
+
+/// Looking for the last line keeps no empty operand open, so more empty operands than the
+/// descriptor limit allows still let a later operand's last line be found. Verified against
+/// the oracle with `ulimit -n 32`.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn last_line_looks_past_more_empty_operands_than_open_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first");
+    let last = dir.path().join("last");
+    std::fs::write(&first, b"1\n2\n").unwrap();
+    std::fs::write(&last, b"x\ny\n").unwrap();
+    let empties: Vec<_> = (0..60)
+        .map(|i| {
+            let path = dir.path().join(format!("e{i}"));
+            std::fs::write(&path, b"").unwrap();
+            path
+        })
+        .collect();
+    new_ucmd!()
+        .limit(rlimit::Resource::NOFILE, 32, 32)
+        .args(&["-n", "$p"])
+        .arg(&first)
+        .args(&empties)
+        .arg(&last)
+        .succeeds()
+        .no_stderr()
+        .stdout_is("y\n");
+}
+
 #[test]
 fn in_place_edit_backup() -> std::io::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2910,6 +3488,31 @@ fn test_l_command_honors_dash_l() {
         .stdout_is("abcdefghi\\\nj$\n");
 }
 
+/// A line length of 0, from `l 0` or `-l 0`, means no wrapping; a length of 1 folds before
+/// every character. Verified against the oracle.
+#[test]
+fn test_l_command_length_zero_does_not_wrap() {
+    let long = "a".repeat(100);
+    for args in [
+        &["-n", "-l", "0", "l"][..],
+        &["-n", "l 0"],
+        &["-n", "-l", "1", "l 0"],
+    ] {
+        new_ucmd!()
+            .args(args)
+            .pipe_in(format!("{long}\n"))
+            .succeeds()
+            .stdout_is(format!("{long}$\n"));
+    }
+    for args in [&["-n", "-l", "1", "l"][..], &["-n", "-l", "0", "l 1"]] {
+        new_ucmd!()
+            .args(args)
+            .pipe_in("abc\n")
+            .succeeds()
+            .stdout_is("\\\na\\\nb\\\nc$\n");
+    }
+}
+
 // FA-077: `--posix` disables the GNU BRE/ERE extensions `\+`, `\?` and `\|`, so they
 // match as literal characters instead of one-or-more/zero-or-one/alternation.
 #[test]
@@ -2971,6 +3574,52 @@ fn test_pathologically_nested_blocks_are_a_compile_error_not_a_crash() {
         .stderr_contains("nested too deeply");
 }
 
+/// An `r` after a line without a terminator first writes the terminator, even when the file
+/// is missing or empty. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn test_r_writes_a_missing_terminator_before_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let t2 = dir.path().join("t2");
+    let empty = dir.path().join("empty");
+    std::fs::write(&t2, b"p\nq\n").unwrap();
+    std::fs::write(&empty, b"").unwrap();
+    let nope = dir.path().join("nope");
+    for (args, input, expected) in [
+        (
+            vec!["-e".into(), format!("n;r {}", t2.display())],
+            &b"x\ny"[..],
+            &b"x\ny\np\nq\n"[..],
+        ),
+        (
+            vec!["-e".into(), format!("$r {}", nope.display())],
+            b"x\ny",
+            b"x\ny\n",
+        ),
+        (
+            vec!["-e".into(), format!("$r {}", empty.display())],
+            b"x\ny",
+            b"x\ny\n",
+        ),
+        (
+            vec!["-n".into(), format!("$p;$r {}", t2.display())],
+            b"x\ny",
+            b"y\np\nq\n",
+        ),
+        (
+            vec!["-z".into(), format!("$r {}", t2.display())],
+            b"a\0b",
+            b"a\0b\0p\nq\n",
+        ),
+    ] {
+        new_ucmd!()
+            .args(&args)
+            .pipe_in(input.to_vec())
+            .succeeds()
+            .stdout_is_bytes(expected);
+    }
+}
+
 // FA-076: GNU's `R` command queues one line from a file per invocation (unlike `r`,
 // which queues the whole file), and a missing file behaves as empty, not an error.
 #[test]
@@ -2995,4 +3644,67 @@ fn test_r_capital_missing_file_is_silently_empty() {
         .pipe_in("a\nb\n")
         .succeeds()
         .stdout_is("a\nb\n");
+}
+
+/// All `R` commands that name the same file share one reader of it. A last line without a
+/// terminator is appended as it is, and the next output follows it directly. Under `-z`, `R`
+/// reads NUL-terminated records. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn test_r_capital_shares_one_reader_per_file_and_appends_lines_as_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path().join("r");
+    let ru = dir.path().join("ru");
+    let rz = dir.path().join("rz");
+    std::fs::write(&r, b"r1\nr2\n").unwrap();
+    std::fs::write(&ru, b"r1\nr2").unwrap();
+    std::fs::write(&rz, b"r1\0r2\0").unwrap();
+    let r_cmd = format!("R {}", r.display());
+    new_ucmd!()
+        .args(&["-e", &r_cmd, "-e", &r_cmd])
+        .pipe_in("a\nb\n")
+        .succeeds()
+        .stdout_is("a\nr1\nr2\nb\n");
+    new_ucmd!()
+        .arg(format!("R {}", ru.display()))
+        .pipe_in("a\nb\nc\n")
+        .succeeds()
+        .stdout_is("a\nr1\nb\nr2c\n");
+    new_ucmd!()
+        .args(&["-z", &format!("R {}", rz.display())])
+        .pipe_in(b"a\0b\0c\0".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"a\0r1\0b\0r2\0c\0");
+    new_ucmd!()
+        .args(&["-z", &r_cmd])
+        .pipe_in(b"a\0b\0".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"a\0r1\nr2\nb\0");
+}
+
+/// With `-s` or `-i`, `R` reads its file from the start again for each input file, as it
+/// was when sed opened it. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn test_r_capital_restarts_for_each_separate_input_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path().join("r");
+    let f1 = dir.path().join("f1");
+    let f2 = dir.path().join("f2");
+    std::fs::write(&r, b"r1\nr2\n").unwrap();
+    std::fs::write(&f1, b"a\nb\nc\n").unwrap();
+    std::fs::write(&f2, b"p\nq\n").unwrap();
+    new_ucmd!()
+        .args(&["-s", &format!("R {}", r.display())])
+        .arg(&f1)
+        .arg(&f2)
+        .succeeds()
+        .stdout_is("a\nr1\nb\nr2\nc\np\nr1\nq\nr2\n");
+    new_ucmd!()
+        .args(&["-i", &format!("R {}", f1.display())])
+        .arg(&f1)
+        .arg(&f2)
+        .succeeds();
+    assert_eq!(std::fs::read(&f1).unwrap(), b"a\na\nb\nb\nc\nc\n");
+    assert_eq!(std::fs::read(&f2).unwrap(), b"p\na\nq\nb\n");
 }

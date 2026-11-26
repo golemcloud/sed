@@ -8,7 +8,7 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-use crate::sed::delimited_parser::byte_from_marker;
+use crate::sed::delimited_parser::{byte_from_marker, byte_marker};
 use crate::sed::error_handling::{ScriptLocation, runtime_error};
 use crate::sed::fast_regex::{Captures, Match, Regex};
 use crate::sed::named_reader::NamedReader;
@@ -81,12 +81,15 @@ pub struct ProcessingContext {
     pub substitution_made: bool,
     /// Elements to append at the end of each command processing cycle
     pub append_elements: Vec<AppendElement>,
+    /// The reader of each file that `R` commands name, one per file name
+    pub read_line_files: Vec<Rc<RefCell<NamedReader>>>,
 }
 
 #[derive(Clone, Debug)]
 /// Elements that shall be appended at the end of each command processing cycle
 pub enum AppendElement {
     Text(Rc<[u8]>), // The specified text bytes
+    Line(Vec<u8>),  // A line `R` read, written exactly as it was read
     Path(PathBuf),  // The contents of the specified file path
 }
 
@@ -143,47 +146,108 @@ pub enum CaseConversion {
 /// Replacement text under GNU case conversion.
 #[derive(Default)]
 struct CasedText {
+    mode: CharacterMode,
     text: Vec<u8>,
     span: Option<CaseConversion>,
     next: Option<CaseConversion>,
 }
 
 impl CasedText {
+    fn new(mode: CharacterMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+
+    /// Apply a conversion escape. `\U`, `\L` and `\E` also cancel a pending `\u` or `\l`.
     fn convert(&mut self, conversion: CaseConversion) {
         match conversion {
-            CaseConversion::Upper | CaseConversion::Lower => self.span = Some(conversion),
-            CaseConversion::End => self.span = None,
+            CaseConversion::Upper | CaseConversion::Lower => {
+                self.span = Some(conversion);
+                self.next = None;
+            }
+            CaseConversion::End => {
+                self.span = None;
+                self.next = None;
+            }
             next => self.next = Some(next),
         }
     }
 
+    /// The conversion for the next character: `\u`/`\l` once, else the `\U`/`\L` span.
+    fn take(&mut self) -> Option<CaseConversion> {
+        self.next.take().or(self.span)
+    }
+
+    /// Append `bytes`, converting one character at a time. In a byte locale GNU 4.9 cases ASCII
+    /// letters and writes `\xff` for each byte above ASCII it converts. Invalid UTF-8 has no
+    /// case in a UTF-8 locale and stays as it is.
     fn push(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
         if self.span.is_none() && self.next.is_none() {
             self.text.extend_from_slice(bytes);
             return;
         }
-        let text = String::from_utf8_lossy(bytes);
-        let mut chars = text.chars();
-        if let Some(next) = self.next.take()
-            && let Some(first) = chars.next()
-        {
-            match next {
-                CaseConversion::UpperNext => {
-                    self.text.extend(first.to_uppercase().to_string().bytes());
-                }
-                _ => self.text.extend(first.to_lowercase().to_string().bytes()),
+        if self.mode == CharacterMode::Byte {
+            for &byte in bytes {
+                let conversion = self.take();
+                self.text.push(match conversion {
+                    Some(CaseConversion::End) | None => byte,
+                    Some(_) if !byte.is_ascii() => 0xff,
+                    Some(CaseConversion::Upper | CaseConversion::UpperNext) => {
+                        byte.to_ascii_uppercase()
+                    }
+                    Some(CaseConversion::Lower | CaseConversion::LowerNext) => {
+                        byte.to_ascii_lowercase()
+                    }
+                });
+            }
+            return;
+        }
+        for chunk in bytes.utf8_chunks() {
+            for ch in chunk.valid().chars() {
+                let mut buf = [0; 4];
+                let ch = match self.take() {
+                    Some(CaseConversion::Upper | CaseConversion::UpperNext) => upper_case(ch),
+                    Some(CaseConversion::Lower | CaseConversion::LowerNext) => lower_case(ch),
+                    _ => ch,
+                };
+                self.text.extend(ch.encode_utf8(&mut buf).bytes());
+            }
+            if !chunk.invalid().is_empty() {
+                self.take();
+                self.text.extend_from_slice(chunk.invalid());
             }
         }
-        let rest: String = chars.collect();
-        let rest = match self.span {
-            Some(CaseConversion::Upper) => rest.to_uppercase(),
-            Some(CaseConversion::Lower) => rest.to_lowercase(),
-            _ => rest,
-        };
-        self.text.extend(rest.bytes());
+    }
+}
+
+/// The upper case of `ch` as one character, as GNU 4.9 converts in a UTF-8 locale. Where the
+/// full mapping has more than one character, the simple mapping applies: the Greek letters
+/// with ypogegrammeni map to their prosgegrammeni capitals, and every other such character
+/// stays as it is (`ß`, `ﬁ`).
+fn upper_case(ch: char) -> char {
+    let mut upper = ch.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(upper), None) => upper,
+        _ => match ch {
+            '\u{1f80}'..='\u{1f87}' | '\u{1f90}'..='\u{1f97}' | '\u{1fa0}'..='\u{1fa7}' => {
+                char::from_u32(u32::from(ch) + 8).unwrap_or(ch)
+            }
+            '\u{1fb3}' | '\u{1fc3}' | '\u{1ff3}' => char::from_u32(u32::from(ch) + 9).unwrap_or(ch),
+            _ => ch,
+        },
+    }
+}
+
+/// The lower case of `ch` as one character, as GNU 4.9 converts in a UTF-8 locale. The only
+/// character whose full mapping has more than one character, `İ`, maps to `i`.
+fn lower_case(ch: char) -> char {
+    let mut lower = ch.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(lower), None) => lower,
+        _ if ch == '\u{130}' => 'i',
+        _ => ch,
     }
 }
 
@@ -232,9 +296,14 @@ impl ReplacementTemplate {
     /// Apply the template to the given RE captures.
     /// Example:
     /// let result = regex.replace_all(input, |caps: &Captures| {
-    ///    template.apply_captures(&command, caps) });
+    ///    template.apply_captures(&command, caps, mode) });
     /// Returns an error if a backreference in the template was not matched by the RE.
-    pub fn apply_captures(&self, command: &Command, caps: &Captures) -> UResult<Vec<u8>> {
+    pub fn apply_captures(
+        &self,
+        command: &Command,
+        caps: &Captures,
+        mode: CharacterMode,
+    ) -> UResult<Vec<u8>> {
         let mut result = Vec::new();
 
         // Invalid group numbers may end here through (unkown at compile time)
@@ -249,7 +318,7 @@ impl ReplacementTemplate {
             );
         }
 
-        let mut cased = CasedText::default();
+        let mut cased = CasedText::new(mode);
         for part in &self.parts {
             match part {
                 ReplacementPart::Literal(s) => cased.push(s),
@@ -272,8 +341,8 @@ impl ReplacementTemplate {
     }
 
     /// Apply the template to the given RE single match.
-    pub fn apply_match(&self, m: &Match) -> Vec<u8> {
-        let mut cased = CasedText::default();
+    pub fn apply_match(&self, m: &Match, mode: CharacterMode) -> Vec<u8> {
+        let mut cased = CasedText::new(mode);
 
         for part in &self.parts {
             match part {
@@ -375,15 +444,15 @@ impl Transliteration {
         } else {
             self.unicode_slow.insert(from, to);
         }
-        // A numeric escape (`\dNNN`, `\oNNN`, `\xHH`) above ASCII reaches here as one of
-        // `delimited_parser`'s private-use markers rather than the byte itself, so a Rust
-        // `String` operand can stay valid UTF-8 — see `push_transliteration_escaped_char`.
-        // Decode it back to the byte GNU would have inserted before deciding whether this
-        // mapping can use the byte-fast path.
+        // A byte that forms no UTF-8 character reaches here as one of `delimited_parser`'s
+        // private-use markers (see `byte_marker`). Only an ASCII source may use the byte-fast
+        // path: a byte above ASCII maps only where it forms no character in the input.
         let from_byte = byte_from_marker(from).or_else(|| from.is_ascii().then_some(from as u8));
         let to_byte = byte_from_marker(to).or_else(|| to.is_ascii().then_some(to as u8));
         match (from_byte, to_byte) {
-            (Some(from_byte), Some(to_byte)) => self.byte_fast[from_byte as usize] = to_byte,
+            (Some(from_byte), Some(to_byte)) if from_byte.is_ascii() => {
+                self.byte_fast[from_byte as usize] = to_byte;
+            }
             _ => self.is_byte_identity = false,
         }
     }
@@ -396,6 +465,34 @@ impl Transliteration {
         } else {
             self.unicode_slow.get(&ch).copied().unwrap_or(ch)
         }
+    }
+
+    /// Append the transliteration of `text` in a UTF-8 locale to `result`, returning whether
+    /// any character changed. A byte that forms no character maps as its marker.
+    pub fn apply_utf8(&self, text: &[u8], result: &mut Vec<u8>) -> bool {
+        let mut replaced = false;
+        let mut push = |from: char, original: &[u8], result: &mut Vec<u8>| {
+            let to = self.lookup_char(from);
+            if to == from {
+                result.extend_from_slice(original);
+                return;
+            }
+            replaced = true;
+            match byte_from_marker(to) {
+                Some(byte) => result.push(byte),
+                None => result.extend_from_slice(to.encode_utf8(&mut [0; 4]).as_bytes()),
+            }
+        };
+        for chunk in text.utf8_chunks() {
+            let valid = chunk.valid();
+            for (index, ch) in valid.char_indices() {
+                push(ch, &valid.as_bytes()[index..index + ch.len_utf8()], result);
+            }
+            for byte in chunk.invalid() {
+                push(byte_marker(*byte), std::slice::from_ref(byte), result);
+            }
+        }
+        replaced
     }
 
     /// Fast byte lookup for pure ASCII transliterations.
@@ -503,7 +600,9 @@ mod tests {
         let caps = caps_for("foo", input);
         let cmd = Command::default();
 
-        let result = template.apply_captures(&cmd, &caps).unwrap();
+        let result = template
+            .apply_captures(&cmd, &caps, CharacterMode::Utf8)
+            .unwrap();
         assert_eq!(result, b"");
     }
 
@@ -515,7 +614,9 @@ mod tests {
         let caps = caps_for("abc", input);
         let cmd = Command::default();
 
-        let result = template.apply_captures(&cmd, &caps).unwrap();
+        let result = template
+            .apply_captures(&cmd, &caps, CharacterMode::Utf8)
+            .unwrap();
         assert_eq!(result, b"hello");
     }
 
@@ -530,7 +631,9 @@ mod tests {
         let caps = caps_for(r"foo\d+", input);
         let cmd = Command::default();
 
-        let result = template.apply_captures(&cmd, &caps).unwrap();
+        let result = template
+            .apply_captures(&cmd, &caps, CharacterMode::Utf8)
+            .unwrap();
         assert_eq!(result, b"got: foo42");
     }
 
@@ -543,7 +646,7 @@ mod tests {
         ]);
         let m = Match::from_bytes(1, 3, b"\xE9x");
 
-        assert_eq!(template.apply_match(&m), b"<\xE9x>");
+        assert_eq!(template.apply_match(&m, CharacterMode::Utf8), b"<\xE9x>");
     }
 
     #[test]
@@ -557,7 +660,9 @@ mod tests {
         let caps = caps_for(r"foo(\d+)", input);
         let cmd = Command::default();
 
-        let result = template.apply_captures(&cmd, &caps).unwrap();
+        let result = template
+            .apply_captures(&cmd, &caps, CharacterMode::Utf8)
+            .unwrap();
         assert_eq!(result, b"number: 42");
     }
 
@@ -574,7 +679,9 @@ mod tests {
         let caps = caps_for(r"(\w+):(\d+)", input);
         let cmd = Command::default();
 
-        let result = template.apply_captures(&cmd, &caps).unwrap();
+        let result = template
+            .apply_captures(&cmd, &caps, CharacterMode::Utf8)
+            .unwrap();
         assert_eq!(result, b"key: x, value: 123");
     }
 
@@ -591,7 +698,7 @@ mod tests {
         let caps = caps_for(r"(\w+):(\d+)", input);
         let cmd = Command::default();
 
-        let result = template.apply_captures(&cmd, &caps);
+        let result = template.apply_captures(&cmd, &caps, CharacterMode::Utf8);
         assert!(result.is_err());
 
         let msg = result.unwrap_err().to_string();
