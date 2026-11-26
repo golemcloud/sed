@@ -126,16 +126,15 @@ pub enum EscapedChar {
 }
 
 /// The base of a reserved, 256-codepoint Unicode Private Use Area block sed's own parser uses
-/// to carry a numeric escape's raw byte value through a `CharacterMode::Utf8` transliteration
-/// operand, so the accumulated buffer stays valid UTF-8 (a Rust `String` cannot hold a byte like
-/// 0xFF on its own) while `Transliteration::insert` (`command.rs`) can still recover the exact
-/// byte GNU would have inserted. Real script text using this obscure PUA block for a `y///`
+/// to carry a byte that forms no UTF-8 character through a `CharacterMode::Utf8`
+/// transliteration operand, so the operand stays a `String` (which cannot hold a byte like
+/// 0xFF on its own) while `Transliteration` (`command.rs`) can still recover the exact byte. Real script text using this obscure PUA block for a `y///`
 /// operand character — or this fork's own `\uE0xx` escape landing in it — would collide; both
 /// are accepted, narrow limitations rather than something worth a second side channel for.
 const BYTE_MARKER_BASE: u32 = 0xE000;
 
 /// Encode `b` as this module's transliteration byte marker (see `BYTE_MARKER_BASE`).
-fn byte_marker(b: u8) -> char {
+pub(crate) fn byte_marker(b: u8) -> char {
     char::from_u32(BYTE_MARKER_BASE + u32::from(b)).expect("BYTE_MARKER_BASE + 0..=255 is valid")
 }
 
@@ -191,27 +190,6 @@ pub fn push_pattern_escaped_char(
     }
 }
 
-/// Append an escaped character for a `y///` operand: like the pattern context, the accumulated
-/// bytes are later re-checked as UTF-8 text in `CharacterMode::Utf8` (`parsed_bytes_to_utf8`),
-/// but unlike a pattern there is no regex engine downstream to interpret an inline escape — a
-/// `y///` operand is matched and substituted one character for one character. So a raw byte
-/// above ASCII is instead stood in for by this module's private-use marker character, which
-/// `Transliteration::insert` (`command.rs`) decodes back to the exact byte.
-pub fn push_transliteration_escaped_char(
-    bytes: &mut Vec<u8>,
-    escaped: EscapedChar,
-    character_mode: CharacterMode,
-) {
-    match escaped {
-        EscapedChar::Byte(b) if character_mode == CharacterMode::Utf8 && b > 0x7F => {
-            let mut buf = [0u8; 4];
-            bytes.extend_from_slice(byte_marker(b).encode_utf8(&mut buf).as_bytes());
-        }
-        EscapedChar::Byte(b) => bytes.push(b),
-        EscapedChar::Char(ch) => push_script_char(bytes, ch, character_mode),
-    }
-}
-
 /// Append an escaped character for a bracket expression's own content (inside the `[...]`,
 /// not the surrounding pattern). Verified against the real oracle: unlike everywhere else, a
 /// `\dNNN`/`\oNNN`/`\xHH` byte escape above ASCII contributes *nothing at all* to a bracket
@@ -231,19 +209,6 @@ fn push_class_escaped_char(
         EscapedChar::Byte(b) => bytes.push(b),
         EscapedChar::Char(ch) => push_script_char(bytes, ch, character_mode),
     }
-}
-
-/// Decode parsed script bytes as UTF-8 for character-mode parsing.
-fn parsed_bytes_to_utf8(
-    lines: &ScriptLineProvider,
-    line: &ScriptCharProvider,
-    bytes: Vec<u8>,
-    description: &str,
-) -> UResult<String> {
-    String::from_utf8(bytes).map_err(|e| {
-        compilation_error::<String>(lines, line, format!("invalid UTF-8 in {description}: {e}"))
-            .unwrap_err()
-    })
 }
 
 /// Parse a character escape valid in all contexts (RE pattern, substitution,
@@ -977,7 +942,7 @@ fn parse_transliteration_bytes(
                     continue;
                 }
                 if let Some(decoded) = parse_char_escape(line) {
-                    push_transliteration_escaped_char(&mut result, decoded, character_mode);
+                    push_escaped_char(&mut result, decoded, character_mode);
                 } else {
                     // Pass through \<any> to tr for literal use
                     result.push(b'\\');
@@ -1003,8 +968,16 @@ pub fn parse_transliteration_for_mode(
     let bytes = parse_transliteration_bytes(lines, line, character_mode)?;
     match character_mode {
         CharacterMode::Byte => Ok(ParsedTransliteration::Bytes(bytes)),
-        CharacterMode::Utf8 => parsed_bytes_to_utf8(lines, line, bytes, "transliteration string")
-            .map(ParsedTransliteration::Text),
+        // As in GNU, the operand's bytes, from escapes or not, form characters, and a byte
+        // that forms none is one character of its own, carried as its marker.
+        CharacterMode::Utf8 => {
+            let mut text = String::with_capacity(bytes.len());
+            for chunk in bytes.utf8_chunks() {
+                text.push_str(chunk.valid());
+                text.extend(chunk.invalid().iter().map(|&b| byte_marker(b)));
+            }
+            Ok(ParsedTransliteration::Text(text))
+        }
     }
 }
 
@@ -1025,22 +998,6 @@ mod tests {
     fn test_os_string_from_bytes_accepts_utf8() {
         let os = os_string_from_bytes("aé".as_bytes().to_vec()).unwrap();
         assert_eq!(os, OsString::from("aé"));
-    }
-
-    #[test]
-    fn test_parsed_bytes_to_utf8_accepts_valid_utf8() {
-        let lines = ScriptLineProvider::with_active_state("test.sed", 1);
-        let line = ScriptCharProvider::new("");
-        let text = parsed_bytes_to_utf8(&lines, &line, "é".as_bytes().to_vec(), "test").unwrap();
-        assert_eq!(text, "é");
-    }
-
-    #[test]
-    fn test_parsed_bytes_to_utf8_rejects_invalid_utf8() {
-        let lines = ScriptLineProvider::with_active_state("test.sed", 1);
-        let line = ScriptCharProvider::new("");
-        let err = parsed_bytes_to_utf8(&lines, &line, b"\xE9".to_vec(), "test").unwrap_err();
-        assert!(err.to_string().contains("invalid UTF-8 in test"));
     }
 
     fn make_providers(input: &str) -> (ScriptLineProvider, ScriptCharProvider) {
@@ -2061,8 +2018,8 @@ mod tests {
     #[test]
     fn test_parse_transliteration_for_mode_utf8() {
         // `\xE9` is GNU's byte escape (raw byte 0xE9), not the Unicode character 'é' (U+00E9):
-        // it comes back as this module's private-use marker for that byte (see
-        // `push_transliteration_escaped_char`/`byte_from_marker`), not the character itself.
+        // alone it forms no character, so it comes back as this module's private-use marker
+        // for that byte (see `byte_marker`), not the character itself.
         let (lines, mut line) = make_providers("/a\\xE9/");
         let parsed =
             parse_transliteration_for_mode(&lines, &mut line, CharacterMode::Utf8).unwrap();
@@ -2071,6 +2028,13 @@ mod tests {
             ParsedTransliteration::Text(format!("a{}", byte_marker(0xE9)))
         );
         assert_eq!(line.current(), '/');
+        let (lines, mut line) = make_providers("/\\xc3\\xa9\\xc3/");
+        let parsed =
+            parse_transliteration_for_mode(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        assert_eq!(
+            parsed,
+            ParsedTransliteration::Text(format!("é{}", byte_marker(0xc3)))
+        );
     }
 
     #[test]

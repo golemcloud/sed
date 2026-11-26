@@ -481,7 +481,6 @@ fn write_named(
 fn transliterate(
     pattern: &mut IOChunk,
     trans: &Transliteration,
-    location: &ScriptLocation,
     context: &ProcessingContext,
 ) -> UResult<()> {
     if context.character_mode == CharacterMode::Byte || trans.is_byte_identity {
@@ -504,29 +503,10 @@ fn transliterate(
         return Ok(());
     }
 
-    let text = pattern.as_str().map_err(|e| {
-        input_runtime_error::<()>(
-            location,
-            context,
-            format!("failed to decode pattern space as UTF-8 for transliteration: {e}"),
-        )
-        .unwrap_err()
-    })?;
-    let mut result = String::with_capacity(text.len());
-    let mut replaced = false;
-
-    // Perform the transliteration.
-    for ch in text.chars() {
-        let mapped = trans.lookup_char(ch);
-        if mapped != ch {
-            replaced = true;
-        }
-        result.push(mapped);
-    }
-
-    // Lazy replace.
-    if replaced {
-        pattern.set_to_string(result, pattern.is_newline_terminated());
+    let text = pattern.as_bytes();
+    let mut result = Vec::with_capacity(text.len());
+    if trans.apply_utf8(text, &mut result) {
+        pattern.set_to_bytes(result, pattern.is_newline_terminated());
     }
 
     Ok(())
@@ -1115,7 +1095,7 @@ pub fn process_line(
                 }
                 'y' => {
                     let trans = extract_variant!(command, Transliteration);
-                    transliterate(&mut pattern, trans, &command.location, context)?;
+                    transliterate(&mut pattern, trans, context)?;
                 }
                 'z' => {
                     // Clear the pattern contents, but preserve newline state

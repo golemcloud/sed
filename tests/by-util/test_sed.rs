@@ -1548,6 +1548,40 @@ fn open_bracket_in_a_bracket_expression_is_literal() {
     }
 }
 
+/// In a UTF-8 locale the bytes of a `y` operand, from escapes or not, form characters, and a
+/// byte that forms none maps only that byte where it forms no character in the input either.
+/// Verified against the oracle.
+#[test]
+fn transliteration_byte_escapes_form_characters_in_utf8() {
+    for (script, input, expected) in [
+        (r"y/\xc3/X/", &b"a\xc3\xa9b\n"[..], &b"a\xc3\xa9b\n"[..]),
+        (r"y/\xc3/X/", b"a\xc3b\n", b"aXb\n"),
+        (r"y/a\xc3/XY/", b"a\xc3\xa9b\xc3\n", b"X\xc3\xa9bY\n"),
+        (r"y/\xc3\xa9/X/", b"a\xc3\xa9b\n", b"aXb\n"),
+        (r"y/é/\xc3/", b"a\xc3\xa9b\n", b"a\xc3b\n"),
+        (r"y/\xc3/é/", b"a\xc3b\n", b"a\xc3\xa9b\n"),
+        (r"y/ab/\xc3\xa9Z/", b"ab\n", b"\xc3\xa9Z\n"),
+        (r"y/é/X/", b"a\xff\xc3\xa9\n", b"a\xffX\n"),
+        ("y/\u{ff}/Y/", b"\xc3\xbf\xff\n", b"Y\xff\n"),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .arg(script)
+            .pipe_in(input.to_vec())
+            .succeeds()
+            .stdout_is_bytes(expected);
+    }
+    for script in [r"y/\xc3\xa9/XY/", r"y/ab/\xc3\xa9/"] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .arg(script)
+            .pipe_in("ab\n")
+            .fails()
+            .code_is(1)
+            .stderr_contains("strings for `y' command are different lengths");
+    }
+}
+
 /// `\<` and `\>` match only at a word's start and end, in BREs and EREs alike. Verified
 /// against the oracle.
 #[test]
@@ -1768,9 +1802,10 @@ fn next_line_continuation_stops_at_separate_file_end() {
     }
 }
 
-/// Reject raw invalid UTF-8 transliteration script bytes in UTF-8 mode.
+/// A raw script byte that forms no UTF-8 character is a `y` character of its own in UTF-8
+/// mode, as with its escape. Verified against the oracle.
 #[test]
-fn trans_raw_invalid_script_byte_rejected_in_c_utf8_locale() {
+fn trans_raw_invalid_script_byte_maps_that_byte_in_c_utf8_locale() {
     let mut script = NamedTempFile::new().expect("create temporary sed script");
     script
         .write_all(b"y/\xE9/Z/")
@@ -1780,8 +1815,9 @@ fn trans_raw_invalid_script_byte_rejected_in_c_utf8_locale() {
     new_ucmd!()
         .env("LC_ALL", "C.UTF-8")
         .args(&["-f", script_path])
-        .fails()
-        .stderr_contains("invalid UTF-8 in transliteration string");
+        .pipe_in(b"a\xe9b\xc3\xa9\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"aZb\xc3\xa9\n");
 }
 
 #[test]

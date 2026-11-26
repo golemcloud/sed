@@ -8,7 +8,7 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-use crate::sed::delimited_parser::byte_from_marker;
+use crate::sed::delimited_parser::{byte_from_marker, byte_marker};
 use crate::sed::error_handling::{ScriptLocation, runtime_error};
 use crate::sed::fast_regex::{Captures, Match, Regex};
 use crate::sed::named_reader::NamedReader;
@@ -444,15 +444,15 @@ impl Transliteration {
         } else {
             self.unicode_slow.insert(from, to);
         }
-        // A numeric escape (`\dNNN`, `\oNNN`, `\xHH`) above ASCII reaches here as one of
-        // `delimited_parser`'s private-use markers rather than the byte itself, so a Rust
-        // `String` operand can stay valid UTF-8 — see `push_transliteration_escaped_char`.
-        // Decode it back to the byte GNU would have inserted before deciding whether this
-        // mapping can use the byte-fast path.
+        // A byte that forms no UTF-8 character reaches here as one of `delimited_parser`'s
+        // private-use markers (see `byte_marker`). Only an ASCII source may use the byte-fast
+        // path: a byte above ASCII maps only where it forms no character in the input.
         let from_byte = byte_from_marker(from).or_else(|| from.is_ascii().then_some(from as u8));
         let to_byte = byte_from_marker(to).or_else(|| to.is_ascii().then_some(to as u8));
         match (from_byte, to_byte) {
-            (Some(from_byte), Some(to_byte)) => self.byte_fast[from_byte as usize] = to_byte,
+            (Some(from_byte), Some(to_byte)) if from_byte.is_ascii() => {
+                self.byte_fast[from_byte as usize] = to_byte;
+            }
             _ => self.is_byte_identity = false,
         }
     }
@@ -465,6 +465,34 @@ impl Transliteration {
         } else {
             self.unicode_slow.get(&ch).copied().unwrap_or(ch)
         }
+    }
+
+    /// Append the transliteration of `text` in a UTF-8 locale to `result`, returning whether
+    /// any character changed. A byte that forms no character maps as its marker.
+    pub fn apply_utf8(&self, text: &[u8], result: &mut Vec<u8>) -> bool {
+        let mut replaced = false;
+        let mut push = |from: char, original: &[u8], result: &mut Vec<u8>| {
+            let to = self.lookup_char(from);
+            if to == from {
+                result.extend_from_slice(original);
+                return;
+            }
+            replaced = true;
+            match byte_from_marker(to) {
+                Some(byte) => result.push(byte),
+                None => result.extend_from_slice(to.encode_utf8(&mut [0; 4]).as_bytes()),
+            }
+        };
+        for chunk in text.utf8_chunks() {
+            let valid = chunk.valid();
+            for (index, ch) in valid.char_indices() {
+                push(ch, &valid.as_bytes()[index..index + ch.len_utf8()], result);
+            }
+            for byte in chunk.invalid() {
+                push(byte_marker(*byte), std::slice::from_ref(byte), result);
+            }
+        }
+        replaced
     }
 
     /// Fast byte lookup for pure ASCII transliterations.
