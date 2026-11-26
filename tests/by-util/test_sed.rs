@@ -1471,6 +1471,45 @@ fn null_data_write_commands_end_records_with_nul() {
     assert_eq!(std::fs::read(&out).unwrap(), b"a\nb\n");
 }
 
+/// Under `-i`, `w /dev/stdout`, `W /dev/stdout` and the `s///w /dev/stdout` flag write to the
+/// real standard output, not to the edited file. A missing terminator is written only before
+/// the next standard output line. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn in_place_write_to_dev_stdout_goes_to_standard_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let nl = dir.path().join("nl");
+    for (script, stdout, edited) in [
+        ("w /dev/stdout", &b"1\n2\n3\n"[..], &b"1\n2\n3\n"[..]),
+        ("s/2/X/w /dev/stdout", b"X\n", b"1\nX\n3\n"),
+        ("N;W /dev/stdout", b"1\n", b"1\n2\n3\n"),
+    ] {
+        std::fs::write(&a, b"1\n2\n3\n").unwrap();
+        new_ucmd!()
+            .args(&["-i", "-e", "1w /dev/stdout", "-e", script])
+            .arg(&a)
+            .succeeds()
+            .stdout_is_bytes([&b"1\n"[..], stdout].concat());
+        assert_eq!(std::fs::read(&a).unwrap(), edited, "{script}");
+    }
+    std::fs::write(&a, b"1\n2\n3\n").unwrap();
+    std::fs::write(&nl, b"x").unwrap();
+    new_ucmd!()
+        .args(&["-n", "-i", "w /dev/stdout"])
+        .arg(&nl)
+        .arg(&a)
+        .succeeds()
+        .stdout_is_bytes(b"x\n1\n2\n3\n");
+    std::fs::write(&nl, b"x").unwrap();
+    new_ucmd!()
+        .args(&["-i", "w /dev/stdout"])
+        .arg(&nl)
+        .succeeds()
+        .stdout_is_bytes(b"x");
+    assert_eq!(std::fs::read(&nl).unwrap(), b"x");
+}
+
 /// `-z` reads NUL-terminated records from files and pipes, with `-s` and `-i` too; a newline
 /// inside a record is ordinary data. Verified against the oracle.
 #[test]

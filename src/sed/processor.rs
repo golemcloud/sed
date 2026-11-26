@@ -458,7 +458,8 @@ fn substitute(
 }
 
 /// Writes a `w` line to its file or, for `/dev/stdout`, to sed's own output as GNU sed does.
-/// A terminated line ends with the record delimiter, NUL under `-z`.
+/// Under `-i`, sed's own output is the edited file, so `/dev/stdout` is the real standard
+/// output. A terminated line ends with the record delimiter, NUL under `-z`.
 fn write_named(
     writer: &RefCell<crate::sed::named_writer::NamedWriter>,
     output: &mut OutputBuffer,
@@ -466,11 +467,14 @@ fn write_named(
     line: &[u8],
     newline: bool,
 ) -> UResult<()> {
+    let delimiter = if context.null_data { b'\0' } else { b'\n' };
     if writer.borrow().is_standard_output() {
+        if context.in_place {
+            return named_writer::write_in_place_standard_output(line, newline, delimiter);
+        }
         output.write_chunk(&IOChunk::from_bytes(line.to_vec(), newline))?;
         return Ok(());
     }
-    let delimiter = if context.null_data { b'\0' } else { b'\n' };
     writer
         .borrow_mut()
         .write_line_bytes(line, newline, delimiter)

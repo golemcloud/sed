@@ -9,10 +9,11 @@
 // file that was distributed with this source code.
 
 use crate::sed::error_handling::{ScriptLocation, runtime_error};
+use crate::sed::fast_io::{IOChunk, OutputBuffer};
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Write, stdout};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -22,6 +23,24 @@ use uucore::error::UResult;
 thread_local! {
     /// Global list of all writers that should be flushed at shutdown
     static FLUSH_LIST: RefCell<Vec<Rc<RefCell<NamedWriter>>>> = const { RefCell::new(Vec::new()) };
+    /// The standard output that every `/dev/stdout` writer shares under `-i`, where sed's own
+    /// output goes to the edited file instead.
+    static IN_PLACE_STANDARD_OUTPUT: RefCell<Option<OutputBuffer>> = const { RefCell::new(None) };
+}
+
+/// Write a `/dev/stdout` line under `-i` to the real standard output. As with sed's own
+/// output, a missing terminator is written only before the next line.
+pub fn write_in_place_standard_output(line: &[u8], newline: bool, delimiter: u8) -> UResult<()> {
+    IN_PLACE_STANDARD_OUTPUT.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let output = cell.get_or_insert_with(|| {
+            let mut output = OutputBuffer::new(Box::new(stdout()));
+            output.set_delimiter(delimiter);
+            output
+        });
+        output.write_chunk(&IOChunk::from_bytes(line.to_vec(), newline))?;
+        Ok(())
+    })
 }
 
 #[derive(Debug)]
@@ -132,6 +151,9 @@ pub fn flush_all() -> UResult<()> {
     let writers = FLUSH_LIST.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     for handle in &writers {
         handle.borrow_mut().flush()?;
+    }
+    if let Some(mut output) = IN_PLACE_STANDARD_OUTPUT.with(|cell| cell.borrow_mut().take()) {
+        output.flush()?;
     }
     Ok(())
 }
