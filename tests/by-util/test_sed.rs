@@ -3186,6 +3186,31 @@ fn test_l_command_honors_dash_l() {
         .stdout_is("abcdefghi\\\nj$\n");
 }
 
+/// A line length of 0, from `l 0` or `-l 0`, means no wrapping; a length of 1 folds before
+/// every character. Verified against the oracle.
+#[test]
+fn test_l_command_length_zero_does_not_wrap() {
+    let long = "a".repeat(100);
+    for args in [
+        &["-n", "-l", "0", "l"][..],
+        &["-n", "l 0"],
+        &["-n", "-l", "1", "l 0"],
+    ] {
+        new_ucmd!()
+            .args(args)
+            .pipe_in(format!("{long}\n"))
+            .succeeds()
+            .stdout_is(format!("{long}$\n"));
+    }
+    for args in [&["-n", "-l", "1", "l"][..], &["-n", "-l", "0", "l 1"]] {
+        new_ucmd!()
+            .args(args)
+            .pipe_in("abc\n")
+            .succeeds()
+            .stdout_is("\\\na\\\nb\\\nc$\n");
+    }
+}
+
 // FA-077: `--posix` disables the GNU BRE/ERE extensions `\+`, `\?` and `\|`, so they
 // match as literal characters instead of one-or-more/zero-or-one/alternation.
 #[test]

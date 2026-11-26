@@ -600,10 +600,11 @@ impl ListLine {
         }
     }
 
-    /// Write a rendered list item, folding before the item if needed.
+    /// Write a rendered list item, folding before the item if needed. A maximum width of 0
+    /// means no folding.
     fn write_item(&mut self, output: &mut OutputBuffer, out_str: &str) -> UResult<()> {
         let out_len = out_str.len();
-        if self.width + out_len + 1 > self.max_width {
+        if self.max_width != 0 && self.width + out_len + 1 > self.max_width {
             self.buffer.push_str("\\\n");
             output.write_str(std::mem::take(&mut self.buffer))?;
             self.width = 0;
