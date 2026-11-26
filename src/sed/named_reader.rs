@@ -8,12 +8,13 @@
 // file that was distributed with this source code.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 
 /// A file `R` reads forward through, one line per invocation. GNU sed treats a file that
 /// doesn't exist or can't be read as empty rather than an error, so opening happens once,
-/// lazily, and any failure just means every future read finds nothing.
+/// and any failure just means every future read finds nothing. All `R` commands that name
+/// the same file share one reader.
 #[derive(Debug)]
 pub struct NamedReader {
     pub path: PathBuf,
@@ -28,18 +29,26 @@ impl NamedReader {
         Self { path, reader }
     }
 
-    /// Return the next line, its trailing newline included when the file has one, or
+    /// Return the next line, its trailing `delimiter` included when the file has one, or
     /// `None` once the file is exhausted (or was never readable).
-    pub fn next_line(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+    pub fn next_line(&mut self, delimiter: u8) -> std::io::Result<Option<Vec<u8>>> {
         let Some(reader) = self.reader.as_mut() else {
             return Ok(None);
         };
         let mut line = Vec::new();
-        let n = reader.read_until(b'\n', &mut line)?;
+        let n = reader.read_until(delimiter, &mut line)?;
         if n == 0 {
             return Ok(None);
         }
         Ok(Some(line))
+    }
+
+    /// Read the file from its start again, as `-s` and `-i` do for each input file. The
+    /// reader keeps the file sed opened, so a file replaced meanwhile is read as it was.
+    pub fn restart(&mut self) {
+        if let Some(reader) = self.reader.as_mut() {
+            let _ = reader.seek(SeekFrom::Start(0));
+        }
     }
 }
 
@@ -59,15 +68,20 @@ mod tests {
     fn reads_one_line_at_a_time() {
         let file = file_with(b"one\ntwo\nthree");
         let mut reader = NamedReader::new(file.path().to_path_buf());
-        assert_eq!(reader.next_line().unwrap(), Some(b"one\n".to_vec()));
-        assert_eq!(reader.next_line().unwrap(), Some(b"two\n".to_vec()));
-        assert_eq!(reader.next_line().unwrap(), Some(b"three".to_vec()));
-        assert_eq!(reader.next_line().unwrap(), None);
+        assert_eq!(reader.next_line(b'\n').unwrap(), Some(b"one\n".to_vec()));
+        assert_eq!(reader.next_line(b'\n').unwrap(), Some(b"two\n".to_vec()));
+        assert_eq!(reader.next_line(b'\n').unwrap(), Some(b"three".to_vec()));
+        assert_eq!(reader.next_line(b'\n').unwrap(), None);
+        reader.restart();
+        assert_eq!(
+            reader.next_line(b'\0').unwrap(),
+            Some(b"one\ntwo\nthree".to_vec())
+        );
     }
 
     #[test]
     fn missing_file_reads_as_empty() {
         let mut reader = NamedReader::new(PathBuf::from("/nonexistent/does-not-exist"));
-        assert_eq!(reader.next_line().unwrap(), None);
+        assert_eq!(reader.next_line(b'\n').unwrap(), None);
     }
 }

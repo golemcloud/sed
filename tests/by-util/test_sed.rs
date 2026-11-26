@@ -3272,3 +3272,66 @@ fn test_r_capital_missing_file_is_silently_empty() {
         .succeeds()
         .stdout_is("a\nb\n");
 }
+
+/// All `R` commands that name the same file share one reader of it. A last line without a
+/// terminator is appended as it is, and the next output follows it directly. Under `-z`, `R`
+/// reads NUL-terminated records. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn test_r_capital_shares_one_reader_per_file_and_appends_lines_as_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path().join("r");
+    let ru = dir.path().join("ru");
+    let rz = dir.path().join("rz");
+    std::fs::write(&r, b"r1\nr2\n").unwrap();
+    std::fs::write(&ru, b"r1\nr2").unwrap();
+    std::fs::write(&rz, b"r1\0r2\0").unwrap();
+    let r_cmd = format!("R {}", r.display());
+    new_ucmd!()
+        .args(&["-e", &r_cmd, "-e", &r_cmd])
+        .pipe_in("a\nb\n")
+        .succeeds()
+        .stdout_is("a\nr1\nr2\nb\n");
+    new_ucmd!()
+        .arg(format!("R {}", ru.display()))
+        .pipe_in("a\nb\nc\n")
+        .succeeds()
+        .stdout_is("a\nr1\nb\nr2c\n");
+    new_ucmd!()
+        .args(&["-z", &format!("R {}", rz.display())])
+        .pipe_in(b"a\0b\0c\0".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"a\0r1\0b\0r2\0c\0");
+    new_ucmd!()
+        .args(&["-z", &r_cmd])
+        .pipe_in(b"a\0b\0".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"a\0r1\nr2\nb\0");
+}
+
+/// With `-s` or `-i`, `R` reads its file from the start again for each input file, as it
+/// was when sed opened it. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn test_r_capital_restarts_for_each_separate_input_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path().join("r");
+    let f1 = dir.path().join("f1");
+    let f2 = dir.path().join("f2");
+    std::fs::write(&r, b"r1\nr2\n").unwrap();
+    std::fs::write(&f1, b"a\nb\nc\n").unwrap();
+    std::fs::write(&f2, b"p\nq\n").unwrap();
+    new_ucmd!()
+        .args(&["-s", &format!("R {}", r.display())])
+        .arg(&f1)
+        .arg(&f2)
+        .succeeds()
+        .stdout_is("a\nr1\nb\nr2\nc\np\nr1\nq\nr2\n");
+    new_ucmd!()
+        .args(&["-i", &format!("R {}", f1.display())])
+        .arg(&f1)
+        .arg(&f2)
+        .succeeds();
+    assert_eq!(std::fs::read(&f1).unwrap(), b"a\na\nb\nb\nc\nc\n");
+    assert_eq!(std::fs::read(&f2).unwrap(), b"p\na\nq\nb\n");
+}

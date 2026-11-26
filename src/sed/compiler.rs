@@ -1385,7 +1385,8 @@ fn compile_write_file_command(
 }
 
 // Handles R (GNU): like 'r', but queues one line from `path` per invocation instead of
-// the whole file. A missing or unreadable file behaves as empty, never an error.
+// the whole file. A missing or unreadable file behaves as empty, never an error. Every `R`
+// that names the same file shares one reader, so each reads the next line.
 fn compile_read_line_command(
     lines: &mut ScriptLineProvider,
     line: &mut ScriptCharProvider,
@@ -1396,7 +1397,19 @@ fn compile_read_line_command(
         return compilation_error(lines, line, ERR_SANDBOX);
     }
     let path = read_file_path(lines, line)?;
-    cmd.data = CommandData::NamedReader(Rc::new(RefCell::new(NamedReader::new(path))));
+    let reader = match context
+        .read_line_files
+        .iter()
+        .find(|reader| reader.borrow().path == path)
+    {
+        Some(reader) => Rc::clone(reader),
+        None => {
+            let reader = Rc::new(RefCell::new(NamedReader::new(path)));
+            context.read_line_files.push(Rc::clone(&reader));
+            reader
+        }
+    };
+    cmd.data = CommandData::NamedReader(reader);
     Ok(CommandHandling::Continue)
 }
 

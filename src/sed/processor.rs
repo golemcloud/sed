@@ -542,6 +542,9 @@ fn flush_appends(output: &mut OutputBuffer, context: &mut ProcessingContext) -> 
             AppendElement::Text(text) => {
                 output.write_bytes(text.as_ref())?;
             }
+            AppendElement::Line(line) => {
+                output.write_raw(line)?;
+            }
             AppendElement::Path(path) => {
                 output.copy_file(path)?;
             }
@@ -956,10 +959,9 @@ pub fn process_line(
                     // (the file vanishing mid-run, say) is treated the same as running out
                     // of lines: nothing is queued, same as GNU sed's "missing file" case.
                     let reader = extract_variant!(command, NamedReader);
-                    if let Ok(Some(line)) = reader.borrow_mut().next_line() {
-                        context
-                            .append_elements
-                            .push(AppendElement::Text(line.into()));
+                    let delimiter = if context.null_data { b'\0' } else { b'\n' };
+                    if let Ok(Some(line)) = reader.borrow_mut().next_line(delimiter) {
+                        context.append_elements.push(AppendElement::Line(line));
                     }
                 }
                 's' => {
@@ -1137,6 +1139,10 @@ pub fn process_all_files(
             // Reset hold space for separate file processing
             context.hold.content.clear();
             context.hold.has_newline = true;
+
+            for reader in &context.read_line_files {
+                reader.borrow_mut().restart();
+            }
         }
 
         context.input_name = path;

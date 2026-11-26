@@ -81,12 +81,15 @@ pub struct ProcessingContext {
     pub substitution_made: bool,
     /// Elements to append at the end of each command processing cycle
     pub append_elements: Vec<AppendElement>,
+    /// The reader of each file that `R` commands name, one per file name
+    pub read_line_files: Vec<Rc<RefCell<NamedReader>>>,
 }
 
 #[derive(Clone, Debug)]
 /// Elements that shall be appended at the end of each command processing cycle
 pub enum AppendElement {
     Text(Rc<[u8]>), // The specified text bytes
+    Line(Vec<u8>),  // A line `R` read, written exactly as it was read
     Path(PathBuf),  // The contents of the specified file path
 }
 

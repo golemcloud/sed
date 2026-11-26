@@ -888,6 +888,14 @@ impl OutputBuffer {
         Ok(())
     }
 
+    /// Write `bytes` exactly as they are, after a deferred newline if one is pending. The
+    /// next output follows them directly, whether or not they end with a newline.
+    pub fn write_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.flush_pending_newline()?;
+        self.flush_mmap(WriteRange::Complete)?;
+        self.out.write_all(bytes)
+    }
+
     /// Write a deferred newline if the last output didn't end with one.
     pub fn flush_pending_newline(&mut self) -> io::Result<()> {
         if self.pending_newline {
@@ -932,6 +940,13 @@ impl OutputBuffer {
                 Ok(())
             }
         }
+    }
+
+    /// Write `bytes` exactly as they are, after a deferred newline if one is pending. The
+    /// next output follows them directly, whether or not they end with a newline.
+    pub fn write_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.flush_pending_newline()?;
+        self.out.write_all(bytes)
     }
 
     /// Write a deferred newline if the last output didn't end with one.
