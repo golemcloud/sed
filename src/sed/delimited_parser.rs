@@ -481,10 +481,9 @@ fn parse_character_class(
 
                 continue;
             }
-            // Not a POSIX construct — treat as literal
-            result.push(b'[');
-            result.push(line.current_byte());
-            line.advance();
+            // Not a POSIX construct: a literal `[`, escaped for the RE engine, which would
+            // read it as a nested class. The character after it is an ordinary member.
+            result.extend_from_slice(br"\[");
             continue;
         }
 
@@ -1579,7 +1578,7 @@ mod tests {
         let result =
             parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
                 .unwrap();
-        assert_eq!(result, b"[[x]");
+        assert_eq!(result, br"[\[x]");
     }
 
     #[test]
@@ -1589,7 +1588,7 @@ mod tests {
         let result =
             parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
                 .unwrap();
-        assert_eq!(result, b"[a[b]");
+        assert_eq!(result, br"[a\[b]");
     }
 
     // parse_regex

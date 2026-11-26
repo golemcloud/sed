@@ -1530,6 +1530,24 @@ fn backslash_in_a_bracket_expression_is_literal() {
     }
 }
 
+/// A `[` inside a bracket expression that starts no `[:`, `[.` or `[=` is a literal member.
+/// Verified against the oracle.
+#[test]
+fn open_bracket_in_a_bracket_expression_is_literal() {
+    for (args, input, expected) in [
+        (&["s/[[]/X/g"][..], "a[b\n", "aXb\n"),
+        (&["s/[a[b]/X/g"], "a[bc\n", "XXXc\n"),
+        (&["-E", "s/[[a]/X/g"], "a[b\n", "XXb\n"),
+        (&[r"s/[\[]/X/g"], "a[\\b\n", "aXXb\n"),
+    ] {
+        new_ucmd!()
+            .args(args)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
 /// `\<` and `\>` match only at a word's start and end, in BREs and EREs alike. Verified
 /// against the oracle.
 #[test]
