@@ -1690,6 +1690,36 @@ fn null_data_write_commands_end_records_with_nul() {
     assert_eq!(std::fs::read(&out).unwrap(), b"a\nb\n");
 }
 
+/// A `w` file line without a terminator gets one only before the file's next line, so only
+/// the file's last line can lack one, with or without `-s`, `-i` and `-z`. Verified against
+/// the oracle.
+#[test]
+#[cfg(unix)]
+fn write_file_defers_a_missing_terminator_to_its_next_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let nl = dir.path().join("nl");
+    let b = dir.path().join("b");
+    let out = dir.path().join("out");
+    for (args, expected) in [
+        (&["-n", "w"][..], &b"x\n4\n5\n"[..]),
+        (&["-n", "-s", "W"], b"x\n4\n5\n"),
+        (&["-i", "w"], b"x\n4\n5\n"),
+        (&["-n", "1w"], b"x"),
+        (&["-z", "-n", "w"], b"x\x004\n5\n"),
+    ] {
+        std::fs::write(&nl, b"x").unwrap();
+        std::fs::write(&b, b"4\n5\n").unwrap();
+        let (script, options) = args.split_last().unwrap();
+        new_ucmd!()
+            .args(options)
+            .arg(format!("{script} {}", out.display()))
+            .arg(&nl)
+            .arg(&b)
+            .succeeds();
+        assert_eq!(std::fs::read(&out).unwrap(), expected, "{args:?}");
+    }
+}
+
 /// Under `-i`, `w /dev/stdout`, `W /dev/stdout` and the `s///w /dev/stdout` flag write to the
 /// real standard output, not to the edited file. A missing terminator is written only before
 /// the next standard output line. Verified against the oracle.

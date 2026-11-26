@@ -50,6 +50,8 @@ pub struct NamedWriter {
     /// `None` for `/dev/stdout`, which, as in GNU sed, is sed's own output rather than a file.
     writer: Option<BufWriter<File>>,
     location: ScriptLocation,
+    /// Whether the last line lacked its terminator, which GNU writes only before the next.
+    pending_delimiter: bool,
 }
 
 impl NamedWriter {
@@ -60,6 +62,7 @@ impl NamedWriter {
                 path,
                 writer: None,
                 location,
+                pending_delimiter: false,
             })));
         }
         let file = OpenOptions::new()
@@ -90,6 +93,7 @@ impl NamedWriter {
             path,
             writer: Some(BufWriter::new(file)),
             location,
+            pending_delimiter: false,
         }));
 
         FLUSH_LIST.with(|list| list.borrow_mut().push(Rc::clone(&writer)));
@@ -106,27 +110,30 @@ impl NamedWriter {
         self.writer.is_none()
     }
 
-    /// Write bytes to the file, possibly terminated with `delimiter`, returning errors.
+    /// Write bytes to the file, possibly terminated with `delimiter`, returning errors. A
+    /// line without a terminator gets one only before the next line.
     pub fn write_line_bytes(&mut self, line: &[u8], newline: bool, delimiter: u8) -> UResult<()> {
         let Some(writer) = self.writer.as_mut() else {
             return Ok(());
         };
-        writer
-            .write_all(line)
-            .and_then(|()| {
-                if newline {
-                    writer.write_all(&[delimiter])
-                } else {
-                    Ok(())
-                }
-            })
-            .map_err(|e| {
-                runtime_error::<()>(
-                    &self.location,
-                    format!("writing to file {}: {e}", self.path.quote()),
-                )
-                .unwrap_err()
-            })
+        let pending = std::mem::replace(&mut self.pending_delimiter, !newline);
+        let mut write = || -> std::io::Result<()> {
+            if pending {
+                writer.write_all(&[delimiter])?;
+            }
+            writer.write_all(line)?;
+            if newline {
+                writer.write_all(&[delimiter])?;
+            }
+            Ok(())
+        };
+        write().map_err(|e| {
+            runtime_error::<()>(
+                &self.location,
+                format!("writing to file {}: {e}", self.path.quote()),
+            )
+            .unwrap_err()
+        })
     }
 
     /// Flush the writer, returning a descriptive error.
@@ -191,6 +198,13 @@ mod tests {
             .unwrap();
         writer.borrow_mut().flush().unwrap();
 
-        assert_eq!(fs::read(path).unwrap(), b"a\xE9");
+        assert_eq!(fs::read(&path).unwrap(), b"a\xE9");
+
+        writer
+            .borrow_mut()
+            .write_line_bytes(b"b", true, b'\n')
+            .unwrap();
+        writer.borrow_mut().flush().unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"a\xE9\nb\n");
     }
 }
