@@ -728,8 +728,10 @@ impl OutputBuffer {
         )))
     }
 
-    /// Copy the specified file to the output.
+    /// Copy the specified file to the output, after a deferred newline if one is pending:
+    /// GNU sed writes that one even when the file is missing or empty.
     pub fn copy_file(&mut self, path: &PathBuf) -> io::Result<()> {
+        self.flush_pending_newline()?;
         // Flush mmap writes, if any.
         #[cfg(unix)]
         {

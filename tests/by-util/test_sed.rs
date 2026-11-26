@@ -3471,6 +3471,52 @@ fn test_pathologically_nested_blocks_are_a_compile_error_not_a_crash() {
         .stderr_contains("nested too deeply");
 }
 
+/// An `r` after a line without a terminator first writes the terminator, even when the file
+/// is missing or empty. Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn test_r_writes_a_missing_terminator_before_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let t2 = dir.path().join("t2");
+    let empty = dir.path().join("empty");
+    std::fs::write(&t2, b"p\nq\n").unwrap();
+    std::fs::write(&empty, b"").unwrap();
+    let nope = dir.path().join("nope");
+    for (args, input, expected) in [
+        (
+            vec!["-e".into(), format!("n;r {}", t2.display())],
+            &b"x\ny"[..],
+            &b"x\ny\np\nq\n"[..],
+        ),
+        (
+            vec!["-e".into(), format!("$r {}", nope.display())],
+            b"x\ny",
+            b"x\ny\n",
+        ),
+        (
+            vec!["-e".into(), format!("$r {}", empty.display())],
+            b"x\ny",
+            b"x\ny\n",
+        ),
+        (
+            vec!["-n".into(), format!("$p;$r {}", t2.display())],
+            b"x\ny",
+            b"y\np\nq\n",
+        ),
+        (
+            vec!["-z".into(), format!("$r {}", t2.display())],
+            b"a\0b",
+            b"a\0b\0p\nq\n",
+        ),
+    ] {
+        new_ucmd!()
+            .args(&args)
+            .pipe_in(input.to_vec())
+            .succeeds()
+            .stdout_is_bytes(expected);
+    }
+}
+
 // FA-076: GNU's `R` command queues one line from a file per invocation (unlike `r`,
 // which queues the whole file), and a missing file behaves as empty, not an error.
 #[test]
