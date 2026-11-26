@@ -160,10 +160,17 @@ impl CasedText {
         }
     }
 
+    /// Apply a conversion escape. `\U`, `\L` and `\E` also cancel a pending `\u` or `\l`.
     fn convert(&mut self, conversion: CaseConversion) {
         match conversion {
-            CaseConversion::Upper | CaseConversion::Lower => self.span = Some(conversion),
-            CaseConversion::End => self.span = None,
+            CaseConversion::Upper | CaseConversion::Lower => {
+                self.span = Some(conversion);
+                self.next = None;
+            }
+            CaseConversion::End => {
+                self.span = None;
+                self.next = None;
+            }
             next => self.next = Some(next),
         }
     }

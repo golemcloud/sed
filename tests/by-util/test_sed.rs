@@ -1407,6 +1407,34 @@ fn case_conversion_follows_the_locale() {
     }
 }
 
+/// A `\L`, `\U` or `\E` cancels a pending `\u` or `\l`, while a `\u` or `\l` after `\U` or
+/// `\L` still converts the next character. Verified against the oracle.
+#[test]
+fn case_span_conversion_cancels_a_pending_next_character_conversion() {
+    for (locale, script, input, expected) in [
+        ("C.UTF-8", r"s/.*/\u\L&/", "hELLO\n", "hello\n"),
+        ("C", r"s/.*/\u\L&/", "hELLO\n", "hello\n"),
+        ("C.UTF-8", r"s/.*/\l\U&/", "hello\n", "HELLO\n"),
+        ("C.UTF-8", r"s/foo/\u\Ezap/", "foo\n", "zap\n"),
+        (
+            "C.UTF-8",
+            r"s/\(foo\) \(bar\)/\u\L\1 \U\2/",
+            "foo bar\n",
+            "foo BAR\n",
+        ),
+        ("C.UTF-8", r"s/\(x*\)\(ab\)/\u\1\L\2/", "ab\n", "ab\n"),
+        ("C.UTF-8", r"s/.*/\L\u&/", "hELLO\n", "Hello\n"),
+        ("C.UTF-8", r"s/.*/\U\l&/", "hello\n", "hELLO\n"),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", locale)
+            .arg(script)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
 /// A `?` or `\?` stacked on a quantifier makes the quantified atom optional, so `X+?` reads as
 /// `(X+)?`, greedy, in BREs and EREs alike. Verified against the oracle.
 #[test]
