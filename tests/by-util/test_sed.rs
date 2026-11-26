@@ -1407,6 +1407,32 @@ fn case_conversion_follows_the_locale() {
     }
 }
 
+/// A `?` or `\?` stacked on a quantifier makes the quantified atom optional, so `X+?` reads as
+/// `(X+)?`, greedy, in BREs and EREs alike. Verified against the oracle.
+#[test]
+fn question_mark_after_a_quantifier_makes_it_optional() {
+    for (args, input, expected) in [
+        (&["-E", "s/a+?/X/"][..], "b\n", "Xb\n"),
+        (&["-E", "s/a{2,3}?b/X/"], "ab\n", "aX\n"),
+        (&["-E", "s/a{2,3}?b/X/"], "aaab\n", "X\n"),
+        (&["-E", "s/a+?/X/g"], "aaab\n", "XbX\n"),
+        (&["-E", "s/(a)+??/X/2"], "aaab\n", "aaabX\n"),
+        (&["-E", "s/[a]+?/X/g"], "aaab\n", "XbX\n"),
+        (&["-E", "s/é+?/X/g"], "ééb\n", "XbX\n"),
+        (&["s/a\\+\\?/X/"], "b\n", "Xb\n"),
+        (&["s/a\\{2\\}\\?b/X/"], "ab\n", "aX\n"),
+        (&["s/\\(ab\\)\\{2\\}\\?c/X/"], "abc\n", "abX\n"),
+        (&["s/a*\\?/X/"], "aaab\n", "Xb\n"),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .args(args)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
 /// `\<` and `\>` match only at a word's start and end, in BREs and EREs alike. Verified
 /// against the oracle.
 #[test]

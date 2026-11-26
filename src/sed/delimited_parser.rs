@@ -537,12 +537,17 @@ pub fn parse_regex_for_mode(
 ) -> UResult<Vec<u8>> {
     let delimiter = scan_delimiter(lines, line)?;
     let mut result = Vec::new();
-    // POSIX has no lazy quantifiers, so a `?`/`\?` stacked straight onto a quantifier
-    // that was just emitted (`a+?`, `a\{2,3\}\?`, a bare `*` followed by `?`, ...) is a
-    // no-op re-quantification in GNU, not Perl-style laziness — which is what it would
-    // read as if passed through unchanged, since the underlying RE engine (`regex`/
-    // `fancy_regex`) gives `+`/`*`/`?`/`{m,n}` their usual Rust-regex meaning either way.
+    // POSIX has no lazy quantifiers: a `?`/`\?` stacked straight onto a quantifier that was
+    // just emitted (`a+?`, `a\{2,3\}\?`, ...) makes the whole quantified atom optional, so
+    // GNU reads `X+?` as `(X+)?`, greedy. Passed through unchanged, the RE engine (`regex`/
+    // `fancy_regex`) would read it as Perl-style laziness instead, so the quantified atom is
+    // wrapped in a non-capturing group that the `?` then applies to.
     let mut just_quantified = false;
+    // Where in `result` the last complete atom starts, which a following quantifier repeats;
+    // `None` at the start of the pattern, a group or an alternative.
+    let mut atom_start: Option<usize> = None;
+    // Where in `result` each open group starts.
+    let mut group_starts: Vec<usize> = Vec::new();
     // Between a `{`/`\{` that opened a recognized `{m,n}` interval and its closing
     // `}`/`\}` — so that closing brace only counts as "just quantified" when it's really
     // closing one, not when it's a literal brace.
@@ -552,6 +557,7 @@ pub fn parse_regex_for_mode(
         just_quantified = false;
         match line.current() {
             '[' if delimiter != '[' => {
+                atom_start = Some(result.len());
                 let cc = parse_character_class(lines, line, character_mode)?;
                 result.extend_from_slice(&cc);
                 continue;
@@ -562,9 +568,18 @@ pub fn parse_regex_for_mode(
             // before anything else, verified against the oracle (`s\a\b\` closes on the very
             // first `\` after each of "a" and "b", it doesn't read as an unterminated escape).
             '\\' if delimiter != '\\' => {
+                let start = result.len();
                 line.advance();
                 if line.eol() {
                     return compilation_error(lines, line, "unterminated regular expression");
+                }
+                let quantifier = match line.current() {
+                    '{' | '}' => true,
+                    '+' | '?' => !posix,
+                    _ => false,
+                };
+                if !(quantifier && matches!(regex_mode, RegexMode::Basic)) {
+                    atom_start = Some(start);
                 }
                 if line.current() == delimiter {
                     // Push escaped delimiter
@@ -599,18 +614,22 @@ pub fn parse_regex_for_mode(
                     }
                     continue;
                 }
-                if line.current() == '+' {
+                if line.current() == '+' && matches!(regex_mode, RegexMode::Basic) {
                     result.push(b'\\');
                     result.push(b'+');
                     line.advance();
                     just_quantified = true;
                     continue;
                 }
-                if line.current() == '?' {
-                    if !quantified {
+                if line.current() == '?' && matches!(regex_mode, RegexMode::Basic) {
+                    if quantified {
+                        if let Some(start) = atom_start {
+                            make_quantified_atom_optional(&mut result, start, regex_mode);
+                        }
+                    } else {
                         result.push(b'\\');
                         result.push(b'?');
-                    } // else: redundant — drop it rather than let it read as lazy.
+                    }
                     line.advance();
                     just_quantified = true;
                     continue;
@@ -650,6 +669,17 @@ pub fn parse_regex_for_mode(
                 if let Some(decoded) = parse_char_escape(line) {
                     push_pattern_escaped_char(&mut result, decoded, character_mode, regex_mode);
                 } else {
+                    if matches!(regex_mode, RegexMode::Basic) {
+                        match line.current() {
+                            '(' => {
+                                group_starts.push(start);
+                                atom_start = None;
+                            }
+                            ')' => atom_start = group_starts.pop(),
+                            '|' => atom_start = None,
+                            _ => {}
+                        }
+                    }
                     // Pass through \<any> to RE engine for further treatment
                     result.push(b'\\');
                     result.push(line.current_byte());
@@ -666,6 +696,9 @@ pub fn parse_regex_for_mode(
                 continue;
             }
             '}' if delimiter != '}' => {
+                if !in_interval {
+                    atom_start = Some(result.len());
+                }
                 result.push(b'}');
                 line.advance();
                 if in_interval {
@@ -687,20 +720,51 @@ pub fn parse_regex_for_mode(
                 continue;
             }
             '?' if delimiter != '?' && matches!(regex_mode, RegexMode::Extended) => {
-                if !quantified {
+                if quantified {
+                    if let Some(start) = atom_start {
+                        make_quantified_atom_optional(&mut result, start, regex_mode);
+                    }
+                } else {
                     result.push(b'?');
-                } // else: redundant — drop it rather than let it read as lazy.
+                }
                 line.advance();
                 just_quantified = true;
                 continue;
             }
 
             c if c == delimiter => return Ok(result),
-            _ => result.push(line.current_byte()),
+            c => {
+                match (c, regex_mode) {
+                    ('(', RegexMode::Extended) => {
+                        group_starts.push(result.len());
+                        atom_start = None;
+                    }
+                    (')', RegexMode::Extended) => {
+                        atom_start = Some(group_starts.pop().unwrap_or(result.len()));
+                    }
+                    ('|', RegexMode::Extended) => atom_start = None,
+                    // A UTF-8 continuation byte belongs to the character it continues.
+                    _ if character_mode == CharacterMode::Utf8
+                        && (0x80..0xc0).contains(&line.current_byte()) => {}
+                    _ => atom_start = Some(result.len()),
+                }
+                result.push(line.current_byte());
+            }
         }
         line.advance();
     }
     compilation_error(lines, line, "unterminated regular expression")
+}
+
+/// Make the quantified atom at `start` in `result` optional, as a `?` stacked on its
+/// quantifier does: `X+` becomes `(?:X+)?`, spelled for `bre_to_ere` in a BRE.
+fn make_quantified_atom_optional(result: &mut Vec<u8>, start: usize, regex_mode: RegexMode) {
+    let (open, close): (&[u8], &[u8]) = match regex_mode {
+        RegexMode::Basic => (br"\(\?:", br"\)\?"),
+        RegexMode::Extended => (b"(?:", b")?"),
+    };
+    result.splice(start..start, open.iter().copied());
+    result.extend_from_slice(close);
 }
 
 // Check for closing brace and the structure/content.
@@ -1524,29 +1588,28 @@ mod tests {
     }
 
     #[test]
-    // FB-067: `?` stacked onto a quantifier is a redundant no-op in GNU, not the lazy
-    // modifier it would read as if passed straight through to the RE engine.
-    fn test_extended_regex_drops_redundant_question_mark_after_quantifier() {
-        let (lines, mut line) = make_providers("/a+?/p");
-        assert_eq!(
-            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
-            b"a+"
-        );
-        let (lines, mut line) = make_providers("/a*?/p");
-        assert_eq!(
-            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
-            b"a*"
-        );
-        let (lines, mut line) = make_providers("/a??/p");
-        assert_eq!(
-            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
-            b"a?"
-        );
-        let (lines, mut line) = make_providers("/a{2,3}?/p");
-        assert_eq!(
-            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
-            b"a{2,3}"
-        );
+    // `?` stacked onto a quantifier makes the quantified atom optional in GNU (`X+?` is
+    // `(X+)?`), not the lazy modifier it would read as if passed straight through to the RE
+    // engine.
+    fn test_extended_regex_makes_quantified_atom_optional_for_stacked_question_mark() {
+        for (script, expected) in [
+            ("/a+?/p", &b"(?:a+)?"[..]),
+            ("/a*?/p", b"(?:a*)?"),
+            ("/a??/p", b"(?:a?)?"),
+            ("/a{2,3}?/p", b"(?:a{2,3})?"),
+            ("/xa+??/p", b"x(?:(?:a+)?)?"),
+            ("/x(ab)+?/p", b"x(?:(ab)+)?"),
+            ("/x[ab]+?/p", b"x(?:[ab]+)?"),
+            ("/x|a\\.+?/p", b"x|a(?:\\.+)?"),
+            ("/a\\++?/p", b"a(?:\\++)?"),
+        ] {
+            let (lines, mut line) = make_providers(script);
+            assert_eq!(
+                parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
+                expected,
+                "{script}"
+            );
+        }
         // A `?` that is NOT immediately after a quantifier stays a real quantifier.
         let (lines, mut line) = make_providers("/ab?/p");
         assert_eq!(
@@ -1556,17 +1619,19 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_regex_drops_redundant_question_mark_after_quantifier() {
-        let (lines, mut line) = make_providers(r"/a\+\?/p");
-        assert_eq!(
-            parse_regex(&lines, &mut line, RegexMode::Basic).unwrap(),
-            br"a\+"
-        );
-        let (lines, mut line) = make_providers(r"/a\{2,3\}\?/p");
-        assert_eq!(
-            parse_regex(&lines, &mut line, RegexMode::Basic).unwrap(),
-            br"a\{2,3\}"
-        );
+    fn test_basic_regex_makes_quantified_atom_optional_for_stacked_question_mark() {
+        for (script, expected) in [
+            (r"/a\+\?/p", &br"\(\?:a\+\)\?"[..]),
+            (r"/a\{2,3\}\?/p", br"\(\?:a\{2,3\}\)\?"),
+            (r"/x\(ab\)*\?/p", br"x\(\?:\(ab\)*\)\?"),
+        ] {
+            let (lines, mut line) = make_providers(script);
+            assert_eq!(
+                parse_regex(&lines, &mut line, RegexMode::Basic).unwrap(),
+                expected,
+                "{script}"
+            );
+        }
     }
 
     #[test]
