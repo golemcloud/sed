@@ -207,21 +207,47 @@ impl CasedText {
         for chunk in bytes.utf8_chunks() {
             for ch in chunk.valid().chars() {
                 let mut buf = [0; 4];
-                match self.take() {
-                    Some(CaseConversion::Upper | CaseConversion::UpperNext) => {
-                        self.text.extend(ch.to_uppercase().to_string().bytes());
-                    }
-                    Some(CaseConversion::Lower | CaseConversion::LowerNext) => {
-                        self.text.extend(ch.to_lowercase().to_string().bytes());
-                    }
-                    _ => self.text.extend(ch.encode_utf8(&mut buf).bytes()),
-                }
+                let ch = match self.take() {
+                    Some(CaseConversion::Upper | CaseConversion::UpperNext) => upper_case(ch),
+                    Some(CaseConversion::Lower | CaseConversion::LowerNext) => lower_case(ch),
+                    _ => ch,
+                };
+                self.text.extend(ch.encode_utf8(&mut buf).bytes());
             }
             if !chunk.invalid().is_empty() {
                 self.take();
                 self.text.extend_from_slice(chunk.invalid());
             }
         }
+    }
+}
+
+/// The upper case of `ch` as one character, as GNU 4.9 converts in a UTF-8 locale. Where the
+/// full mapping has more than one character, the simple mapping applies: the Greek letters
+/// with ypogegrammeni map to their prosgegrammeni capitals, and every other such character
+/// stays as it is (`ß`, `ﬁ`).
+fn upper_case(ch: char) -> char {
+    let mut upper = ch.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(upper), None) => upper,
+        _ => match ch {
+            '\u{1f80}'..='\u{1f87}' | '\u{1f90}'..='\u{1f97}' | '\u{1fa0}'..='\u{1fa7}' => {
+                char::from_u32(u32::from(ch) + 8).unwrap_or(ch)
+            }
+            '\u{1fb3}' | '\u{1fc3}' | '\u{1ff3}' => char::from_u32(u32::from(ch) + 9).unwrap_or(ch),
+            _ => ch,
+        },
+    }
+}
+
+/// The lower case of `ch` as one character, as GNU 4.9 converts in a UTF-8 locale. The only
+/// character whose full mapping has more than one character, `İ`, maps to `i`.
+fn lower_case(ch: char) -> char {
+    let mut lower = ch.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(lower), None) => lower,
+        _ if ch == '\u{130}' => 'i',
+        _ => ch,
     }
 }
 

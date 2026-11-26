@@ -1407,6 +1407,29 @@ fn case_conversion_follows_the_locale() {
     }
 }
 
+/// In a UTF-8 locale case conversion maps one character to one character: a character whose
+/// full mapping has more than one character keeps its simple mapping, or stays as it is when
+/// it has none. Verified against the oracle over every code point.
+#[test]
+fn case_conversion_maps_one_character_to_one_character() {
+    for (script, input, expected) in [
+        (r"s/.*/\U&/", "ßﬁŉǰ\n", "ßﬁŉǰ\n"),
+        (r"s/.*/\u&/", "ß\n", "ß\n"),
+        (r"s/.*/\L&/", "İ\n", "i\n"),
+        (r"s/.*/\l&/", "İX\n", "iX\n"),
+        (r"s/.*/\U&/", "ᾀᾗᾧᾳῃῳ\n", "ᾈᾟᾯᾼῌῼ\n"),
+        (r"s/.*/\L&/", "ᾈᾼ\n", "ᾀᾳ\n"),
+        (r"s/.*/\U&/", "éσ\n", "ÉΣ\n"),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .arg(script)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
 /// A `\L`, `\U` or `\E` cancels a pending `\u` or `\l`, while a `\u` or `\l` after `\U` or
 /// `\L` still converts the next character. Verified against the oracle.
 #[test]
