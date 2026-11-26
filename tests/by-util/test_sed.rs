@@ -1345,6 +1345,50 @@ fn n_at_eof_terminator_carries_across_file_operands_with_separate() {
         .stdout_is_bytes(b"a\nb");
 }
 
+/// A line without a terminator gets one only before the next output, also when that output
+/// comes from the next file operand, so only output that ends the run can lack one. Verified
+/// against the oracle.
+#[test]
+#[cfg(unix)]
+fn unterminated_file_ends_its_line_before_the_next_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let nl = dir.path().join("nl");
+    let b = dir.path().join("b");
+    let empty = dir.path().join("empty");
+    std::fs::write(&nl, b"x").unwrap();
+    std::fs::write(&b, b"4\n5\n").unwrap();
+    std::fs::write(&empty, b"").unwrap();
+    for (args, expected) in [
+        (vec!["".to_string()], &b"x\n4\n5\n"[..]),
+        (vec!["-n".into(), "p".into()], b"x\n4\n5\n"),
+        (vec!["N;N".into()], b"x\n4\n5\n"),
+        (vec!["l".into()], b"x$\nx\n4$\n4\n5$\n5\n"),
+        (vec!["-n".into(), "1p".into()], b"x"),
+        (vec!["1!G;h;$!d".into()], b"5\n4\nx"),
+    ] {
+        new_ucmd!()
+            .args(&args)
+            .arg(&nl)
+            .arg(&empty)
+            .arg(&b)
+            .succeeds()
+            .stdout_is_bytes(expected);
+    }
+    new_ucmd!()
+        .args(&["-z", ""])
+        .arg(&nl)
+        .arg(&b)
+        .succeeds()
+        .stdout_is_bytes(b"x\x004\n5\n");
+    new_ucmd!()
+        .arg("")
+        .arg(&b)
+        .arg(&nl)
+        .arg(&empty)
+        .succeeds()
+        .stdout_is_bytes(b"4\n5\nx");
+}
+
 /// Without `-s`, two file operands form one continuous stream: `N` reads straight across the
 /// boundary as a real join (not an "N at EOF" case at all, so `f1`'s own missing terminator
 /// is irrelevant — it is `f2`'s line that `N` actually joins with, using the ordinary
