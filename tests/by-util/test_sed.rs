@@ -1503,6 +1503,33 @@ fn alpha_class_is_unicode_only_inside_a_bracket_expression() {
     }
 }
 
+/// Inside a bracket expression a backslash that starts no character escape is a literal
+/// backslash, and the character after it is an ordinary member: `[\<]` matches `\` and `<`,
+/// and `[\]` closes after the backslash. `\n` and the other character escapes except `\b`
+/// still work there. Verified against the oracle.
+#[test]
+fn backslash_in_a_bracket_expression_is_literal() {
+    for (args, input, expected) in [
+        (&[r"s/[\<]/X/g"][..], "a<\\b\n", "aXXb\n"),
+        (&["-E", r"s/[\>]/X/g"], "a>\\b\n", "aXXb\n"),
+        (&[r"s/[\b]/X/g"], "ab\\\n", "aXX\n"),
+        (&[r"s/[\w]/X/g"], "aw\\\n", "aXX\n"),
+        (&[r"s/[\]/X/g"], "a\\]\n", "aX]\n"),
+        (&[r"s/[^\^]/X/g"], "a\\^\n", "X\\^\n"),
+        (&[r"s/[\/]/X/g"], "a/\\\n", "aXX\n"),
+        (&[r"s/[\é]/X/g"], "é\\b\n", "XXb\n"),
+        (&[r"N;s/[\n]/X/"], "a\nb\n", "aXb\n"),
+        (&[r"s/[\t]/X/"], "a\tb\n", "aXb\n"),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .args(args)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
 /// `\<` and `\>` match only at a word's start and end, in BREs and EREs alike. Verified
 /// against the oracle.
 #[test]

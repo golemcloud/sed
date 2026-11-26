@@ -494,12 +494,18 @@ fn parse_character_class(
             if line.eol() {
                 break;
             }
-            if let Some(decoded) = parse_char_escape(line) {
+            // GNU decodes `\\` and the character escapes here too, except `\b`. Any other
+            // backslash is a literal member, and the character after it is an ordinary member,
+            // so `[\<]` matches `\` and `<`, and `[\]` closes after the backslash.
+            if line.current() == '\\' {
+                result.extend_from_slice(br"\\");
+                line.advance();
+            } else if line.current() != 'b'
+                && let Some(decoded) = parse_char_escape(line)
+            {
                 push_class_escaped_char(&mut result, decoded, character_mode);
             } else {
-                result.push(b'\\');
-                result.push(line.current_byte());
-                line.advance();
+                result.extend_from_slice(br"\\");
             }
         } else {
             result.push(line.current_byte());
@@ -1478,13 +1484,15 @@ mod tests {
     }
 
     #[test]
-    fn test_escaped_delimiter() {
+    // A backslash is a literal member, so the first `]` closes the bracket, as in GNU.
+    fn test_backslash_before_closing_bracket() {
         let mut line = char_provider_from("[a\\]bc]");
         let lines = test_lines();
         let result =
             parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
                 .unwrap();
-        assert_eq!(result, br"[a\]bc]");
+        assert_eq!(result, br"[a\\]");
+        assert_eq!(line.current(), 'b');
     }
 
     #[test]
@@ -1826,10 +1834,10 @@ mod tests {
     }
 
     #[test]
-    fn test_regex_with_escaped_bracket_in_character_class() {
+    fn test_regex_with_backslash_before_closing_bracket() {
         let (lines, mut line) = make_providers("/[a\\]z]/");
         let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-        assert_eq!(parsed, br"[a\]z]");
+        assert_eq!(parsed, br"[a\\]z]");
         assert_eq!(line.current(), '/');
     }
 
