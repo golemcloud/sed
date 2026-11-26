@@ -359,6 +359,7 @@ fn parse_character_class(
     lines: &ScriptLineProvider,
     line: &mut ScriptCharProvider,
     character_mode: CharacterMode,
+    regex_mode: RegexMode,
 ) -> UResult<Vec<u8>> {
     let mut result = Vec::new();
 
@@ -440,9 +441,25 @@ fn parse_character_class(
                         line.advance();
                         if !line.eol() && line.current() == ']' {
                             line.advance();
-                            result.extend_from_slice(&inner);
-                            result.push(marker as u8);
-                            result.push(b']');
+                            // GNU's `[:alpha:]` is locale-aware, but the RE engine's own
+                            // POSIX classes are ASCII-only (`[[:alpha:]]` won't match "é"
+                            // even with Unicode on), so in a UTF-8 locale it becomes the
+                            // Unicode letter class, spelled for `bre_to_ere` in a BRE. In the C
+                            // locale GNU's is ASCII-only too.
+                            if marker == ':'
+                                && inner == b"alpha"
+                                && character_mode == CharacterMode::Utf8
+                            {
+                                result.truncate(result.len() - 2);
+                                result.extend_from_slice(match regex_mode {
+                                    RegexMode::Basic => br"\p\{Alphabetic\}",
+                                    RegexMode::Extended => br"\p{Alphabetic}",
+                                });
+                            } else {
+                                result.extend_from_slice(&inner);
+                                result.push(marker as u8);
+                                result.push(b']');
+                            }
                             terminated = true;
                             break;
                         }
@@ -558,7 +575,7 @@ pub fn parse_regex_for_mode(
         match line.current() {
             '[' if delimiter != '[' => {
                 atom_start = Some(result.len());
-                let cc = parse_character_class(lines, line, character_mode)?;
+                let cc = parse_character_class(lines, line, character_mode, regex_mode)?;
                 result.extend_from_slice(&cc);
                 continue;
             }
@@ -1337,7 +1354,9 @@ mod tests {
     fn test_basic_character_class() {
         let mut line = char_provider_from("[qr]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[qr]");
     }
 
@@ -1345,7 +1364,9 @@ mod tests {
     fn test_negated_class() {
         let mut line = char_provider_from("[^abc]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[^abc]");
     }
 
@@ -1353,7 +1374,9 @@ mod tests {
     fn test_leading_close_bracket() {
         let mut line = char_provider_from("[]abc]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[]abc]");
     }
 
@@ -1361,7 +1384,9 @@ mod tests {
     fn test_leading_negated_close_bracket() {
         let mut line = char_provider_from("[^]abc]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[^]abc]");
     }
 
@@ -1376,7 +1401,9 @@ mod tests {
     fn test_byte_escape_dropped_among_other_members() {
         let mut line = char_provider_from("[a\\xffb-d]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[ab-d]");
     }
 
@@ -1384,7 +1411,9 @@ mod tests {
     fn test_byte_escape_only_becomes_never_matches() {
         let mut line = char_provider_from("[\\xff]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, br"\b\B");
     }
 
@@ -1392,7 +1421,9 @@ mod tests {
     fn test_negated_byte_escape_only_becomes_matches_anything() {
         let mut line = char_provider_from("[^\\xff]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b".");
     }
 
@@ -1400,7 +1431,9 @@ mod tests {
     fn test_byte_escape_after_leading_close_bracket_keeps_the_literal() {
         let mut line = char_provider_from("[]\\xff]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[]]");
     }
 
@@ -1408,7 +1441,9 @@ mod tests {
     fn test_byte_escape_in_byte_mode_is_unaffected() {
         let mut line = char_provider_from("[\\xff]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Byte).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Byte, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[\xff]");
     }
 
@@ -1416,7 +1451,9 @@ mod tests {
     fn test_escaped_character_begin() {
         let mut line = char_provider_from("[\\nabc]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[\nabc]");
     }
 
@@ -1424,7 +1461,9 @@ mod tests {
     fn test_escaped_character_middle() {
         let mut line = char_provider_from("[a\\nbc]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[a\nbc]");
     }
 
@@ -1432,7 +1471,9 @@ mod tests {
     fn test_escaped_character_end() {
         let mut line = char_provider_from("[abc\\n]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[abc\n]");
     }
 
@@ -1440,7 +1481,9 @@ mod tests {
     fn test_escaped_delimiter() {
         let mut line = char_provider_from("[a\\]bc]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, br"[a\]bc]");
     }
 
@@ -1448,7 +1491,9 @@ mod tests {
     fn test_posix_class() {
         let mut line = char_provider_from("[[:digit:]]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[[:digit:]]");
     }
 
@@ -1456,7 +1501,9 @@ mod tests {
     fn test_colon_literal_character_class() {
         let mut line = char_provider_from("[:]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[:]");
     }
 
@@ -1464,7 +1511,9 @@ mod tests {
     fn test_equivalence_class() {
         let mut line = char_provider_from("[[=a=]]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[[=a=]]");
     }
 
@@ -1472,7 +1521,9 @@ mod tests {
     fn test_collating_symbol() {
         let mut line = char_provider_from("[[.ch.]]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[[.ch.]]");
     }
 
@@ -1480,7 +1531,8 @@ mod tests {
     fn test_unterminated_class_error() {
         let mut line = char_provider_from("[abc"); // missing closing ]
         let lines = test_lines();
-        let err = parse_character_class(&lines, &mut line, CharacterMode::Utf8);
+        let err =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended);
         assert!(err.is_err());
     }
 
@@ -1488,7 +1540,9 @@ mod tests {
     fn test_open_bracket_at_eol_errors() {
         let mut line = char_provider_from("[");
         let lines = test_lines();
-        let err = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap_err();
+        let err =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap_err();
         assert!(err.to_string().contains("Unterminated bracket expression"));
     }
 
@@ -1496,7 +1550,8 @@ mod tests {
     fn test_unterminated_posix_class_error() {
         let mut line = char_provider_from("[[:digit:]");
         let lines = test_lines();
-        let err = parse_character_class(&lines, &mut line, CharacterMode::Utf8);
+        let err =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended);
         assert!(err.is_err());
     }
 
@@ -1504,7 +1559,8 @@ mod tests {
     fn test_unterminated_escape_error() {
         let mut line = char_provider_from("[abc\\"); // missing closing ]
         let lines = test_lines();
-        let err = parse_character_class(&lines, &mut line, CharacterMode::Utf8);
+        let err =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended);
         assert!(err.is_err());
     }
 
@@ -1512,7 +1568,9 @@ mod tests {
     fn test_malformed_posix_like_pattern_treated_as_literal() {
         let mut line = char_provider_from("[[x]yz]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[[x]");
     }
 
@@ -1520,7 +1578,9 @@ mod tests {
     fn test_literal_open_bracket_in_character_class() {
         let mut line = char_provider_from("[a[b]");
         let lines = test_lines();
-        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        let result =
+            parse_character_class(&lines, &mut line, CharacterMode::Utf8, RegexMode::Extended)
+                .unwrap();
         assert_eq!(result, b"[a[b]");
     }
 
@@ -1616,6 +1676,43 @@ mod tests {
             parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
             b"ab?"
         );
+    }
+
+    #[test]
+    fn test_alpha_class_becomes_unicode_letters_only_in_a_utf8_bracket_expression() {
+        for (script, regex_mode, character_mode, expected) in [
+            (
+                "/[[:alpha:]]/",
+                RegexMode::Extended,
+                CharacterMode::Utf8,
+                &br"[\p{Alphabetic}]"[..],
+            ),
+            (
+                "/[[:alpha:]]/",
+                RegexMode::Basic,
+                CharacterMode::Utf8,
+                br"[\p\{Alphabetic\}]",
+            ),
+            (
+                "/[[:alpha:]]/",
+                RegexMode::Extended,
+                CharacterMode::Byte,
+                b"[[:alpha:]]",
+            ),
+            (
+                r"/\[:alpha:]/",
+                RegexMode::Extended,
+                CharacterMode::Utf8,
+                br"\[:alpha:]",
+            ),
+        ] {
+            let (lines, mut line) = make_providers(script);
+            assert_eq!(
+                parse_regex_for_mode(&lines, &mut line, regex_mode, character_mode, false).unwrap(),
+                expected,
+                "{script}"
+            );
+        }
     }
 
     #[test]

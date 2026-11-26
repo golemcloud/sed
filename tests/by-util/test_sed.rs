@@ -1484,6 +1484,25 @@ fn question_mark_after_a_quantifier_makes_it_optional() {
     }
 }
 
+/// In a UTF-8 locale `[[:alpha:]]` matches any letter, while `[:alpha:]` after an escaped `[`
+/// is literal text. Verified against the oracle.
+#[test]
+fn alpha_class_is_unicode_only_inside_a_bracket_expression() {
+    for (args, input, expected) in [
+        (&[r"s/\[:alpha:]/X/"][..], "a[:alpha:]b\n", "aXb\n"),
+        (&["-E", r"s/\[:alpha:]/X/"], "a[:alpha:]b\n", "aXb\n"),
+        (&["s/[[:alpha:]]/X/g"], "aé1\n", "XX1\n"),
+        (&["s/[^[:alpha:]]/X/g"], "aé1\n", "aéX\n"),
+    ] {
+        new_ucmd!()
+            .env("LC_ALL", "C.UTF-8")
+            .args(args)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
 /// `\<` and `\>` match only at a word's start and end, in BREs and EREs alike. Verified
 /// against the oracle.
 #[test]
