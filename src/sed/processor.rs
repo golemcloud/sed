@@ -22,6 +22,7 @@ use crate::sed::named_writer;
 use memchr::memchr;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
@@ -79,13 +80,9 @@ fn match_address(
 
         Address::Line(lineno) => Ok(context.line_number == *lineno),
 
-        // Recognize "$" as the last line of last file. This is consistent
-        // with the original 7th Research Edition implementation:
-        // https://github.com/dspinellis/unix-history-repo/blob/Research-V7/usr/src/cmd/sed/sed1.c#L665
-        // The FreeBSD version checked for subsequent empty files, but this
-        // can lead to destructive reads (e.g. from named pipes),
-        // and is probably an overkill.
-        Address::Last => Ok(reader.last_line()? && (context.last_file || context.separate)),
+        // "$" is the last line of the input: of each file with `-s` or `-i`, else of the
+        // last operand that has one, as GNU sed reads ahead past empty and unreadable ones.
+        Address::Last => Ok(reader.last_line()?),
 
         _ => panic!("invalid address type in match_address"),
     }
@@ -698,19 +695,97 @@ pub(crate) fn process_address_0(
     Ok(())
 }
 
+/// The input operands after the one being read, with their position among all operands. A
+/// later operand is opened when its turn comes, or earlier when the script asks whether the
+/// current line is the last one.
+struct LaterFiles {
+    opened: VecDeque<(usize, PathBuf, LineReader<'static>)>,
+    unopened: VecDeque<(usize, PathBuf)>,
+    delimiter: u8,
+}
+
+impl LaterFiles {
+    /// Open `path` for reading, or report it as GNU sed does and return `None`.
+    fn open(path: &PathBuf, delimiter: u8) -> Option<LineReader<'static>> {
+        match LineReader::open(path) {
+            Ok(mut reader) => {
+                reader.set_delimiter(delimiter);
+                Some(reader)
+            }
+            Err(error) => {
+                // Under wasm32-wasip2, `io::Error`'s own `Display` appends a
+                // "(os error N)" suffix GNU's own message never has.
+                let text = error.to_string();
+                let text = text.find(" (os error ").map_or(&*text, |i| &text[..i]);
+                eprintln!("sed: can't read {}: {text}", path.display());
+                set_exit_code(2);
+                None
+            }
+        }
+    }
+
+    /// The next operand that can be read, after reporting those that cannot.
+    fn next(&mut self) -> Option<(usize, PathBuf, LineReader<'static>)> {
+        if let Some(file) = self.opened.pop_front() {
+            return Some(file);
+        }
+        while let Some((index, path)) = self.unopened.pop_front() {
+            if let Some(reader) = Self::open(&path, self.delimiter) {
+                return Some((index, path, reader));
+            }
+        }
+        None
+    }
+
+    /// Whether any later operand has a line to read.
+    fn have_data(&mut self) -> io::Result<bool> {
+        for (_, _, reader) in &mut self.opened {
+            // A reader that has returned no line yet is at its last line only when empty.
+            if !reader.last_line()? {
+                return Ok(true);
+            }
+        }
+        while let Some((index, path)) = self.unopened.pop_front() {
+            if let Some(mut reader) = Self::open(&path, self.delimiter) {
+                let empty = reader.last_line()?;
+                self.opened.push_back((index, path, reader));
+                if !empty {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// The operand being read, and the ones after it.
+struct Input<'a> {
+    reader: &'a mut LineReader<'static>,
+    later: &'a mut LaterFiles,
+    separate: bool,
+}
+
+impl LastLine for Input<'_> {
+    /// With `-s` or `-i` each file's own last line; else the last line of the last operand
+    /// that has one.
+    fn last_line(&mut self) -> io::Result<bool> {
+        Ok(self.reader.last_line()? && (self.separate || !self.later.have_data()?))
+    }
+}
+
 #[allow(clippy::cognitive_complexity)]
 /// Process a single input file
 fn process_file(
     commands: Option<Rc<RefCell<Command>>>,
-    reader: &mut LineReader,
+    input: &mut Input,
     output: &mut OutputBuffer,
     context: &mut ProcessingContext,
 ) -> UResult<()> {
     process_address_0(commands.clone(), output)?;
 
     // Loop over the input lines as pattern space.
-    while let Some(pattern) = reader.get_line()? {
-        process_line(commands.clone(), pattern, reader, output, context)?;
+    while let Some(pattern) = input.reader.get_line()? {
+        process_line(commands.clone(), pattern, input, output, context)?;
         if context.stop_processing {
             // `q` ends its line with a terminator; `n` quitting at the last line does not.
             if context.quit_code.is_some() {
@@ -1110,27 +1185,18 @@ pub fn process_all_files(
 
     let mut in_place = InPlace::new(context.clone());
     let last_file_index = files.len() - 1;
+    // FA-082: GNU reports an unreadable file and keeps going — the remaining operands
+    // still get edited — rather than stopping the whole `-i`/`-s` run at the first one.
+    // Verified against the oracle: `sed -i 's/a/z/' nope a` reports
+    // `sed: can't read nope: No such file or directory`, edits `a`, and exits 2.
+    let mut later = LaterFiles {
+        opened: VecDeque::new(),
+        unopened: files.into_iter().enumerate().collect(),
+        delimiter: if context.null_data { b'\0' } else { b'\n' },
+    };
 
-    for (index, path) in files.into_iter().enumerate() {
+    while let Some((index, path, mut reader)) = later.next() {
         context.last_file = index == last_file_index;
-        // FA-082: GNU reports an unreadable file and keeps going — the remaining operands
-        // still get edited — rather than stopping the whole `-i`/`-s` run at the first one,
-        // which is what letting this propagate via `?` did (and left every later file
-        // untouched). Verified against the oracle: `sed -i 's/a/z/' nope a` reports
-        // `sed: can't read nope: No such file or directory`, edits `a`, and exits 2.
-        let mut reader = match LineReader::open(&path) {
-            Ok(reader) => reader,
-            Err(error) => {
-                // Under wasm32-wasip2, `io::Error`'s own `Display` appends a
-                // "(os error N)" suffix GNU's own message never has.
-                let text = error.to_string();
-                let text = text.find(" (os error ").map_or(&*text, |i| &text[..i]);
-                eprintln!("sed: can't read {}: {text}", path.display());
-                set_exit_code(2);
-                continue;
-            }
-        };
-        reader.set_delimiter(if context.null_data { b'\0' } else { b'\n' });
         let output = in_place.begin(&path)?;
 
         if context.separate || index == 0 {
@@ -1147,28 +1213,35 @@ pub fn process_all_files(
         }
 
         context.input_name = path;
-        process_file(commands.clone(), &mut reader, output, context)?;
-
-        // Handle any N command remains.
-        if context.last_file
-            && !context.separate
-            && !context.quiet
-            && let Some(InputAction {
-                prepend: Some(pending),
-                terminated,
-                ..
-            }) = context.input_action.take()
-        {
-            // See the `context.separate` branch above for why `write_chunk`, not
-            // `write_bytes`, and why `terminated` rather than always appending one.
-            output.write_chunk(&IOChunk::from_bytes(pending, terminated))?;
-        }
+        let mut input = Input {
+            reader: &mut reader,
+            later: &mut later,
+            separate: context.separate,
+        };
+        process_file(commands.clone(), &mut input, output, context)?;
 
         in_place.end()?;
 
         if context.stop_processing {
             break;
         }
+    }
+
+    // Handle any N command remains once the last operand, readable or not, has had its turn.
+    if !context.separate
+        && !context.quiet
+        && let Some(InputAction {
+            prepend: Some(pending),
+            terminated,
+            ..
+        }) = context.input_action.take()
+    {
+        // See `process_file`'s `context.separate` branch for why `write_chunk`, not
+        // `write_bytes`, and why `terminated` rather than always appending one.
+        in_place
+            .output
+            .write_chunk(&IOChunk::from_bytes(pending, terminated))?;
+        in_place.output.flush()?;
     }
 
     // Flush all output files

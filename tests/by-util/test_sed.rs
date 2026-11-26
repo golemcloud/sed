@@ -2568,6 +2568,54 @@ fn in_place_edit_continues_past_an_unreadable_file() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Without `-s`, the last line is the last line of the last operand that has one: empty and
+/// unreadable operands after it do not hide it, and an unreadable one is still reported once.
+/// Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn last_line_looks_past_empty_and_unreadable_operands() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let empty = dir.path().join("empty");
+    let nope = dir.path().join("nope");
+    std::fs::write(&a, b"1\n2\n3\n").unwrap();
+    std::fs::write(&empty, b"").unwrap();
+    for (script, expected) in [
+        ("N", "1\n2\n3\n"),
+        ("$d", "1\n2\n"),
+        ("$!N;s/\\n/+/", "1+2\n3\n"),
+    ] {
+        let result = new_ucmd!().arg(script).arg(&a).arg(&nope).fails();
+        result.code_is(2);
+        result.stdout_is(expected);
+        result.stderr_is(format!(
+            "sed: can't read {}: No such file or directory\n",
+            nope.display()
+        ));
+    }
+    new_ucmd!()
+        .args(&["-n", "$p"])
+        .arg(&a)
+        .arg(&empty)
+        .arg(&empty)
+        .succeeds()
+        .stdout_is("3\n");
+    new_ucmd!()
+        .args(&["$a X"])
+        .arg(&a)
+        .arg(&empty)
+        .succeeds()
+        .stdout_is("1\n2\n3\nX\n");
+    let result = new_ucmd!()
+        .args(&["-n", "$="])
+        .arg(&a)
+        .arg(&nope)
+        .arg(&empty)
+        .fails();
+    result.code_is(2);
+    result.stdout_is("3\n");
+}
+
 #[test]
 fn in_place_edit_backup() -> std::io::Result<()> {
     let dir = tempfile::tempdir()?;
