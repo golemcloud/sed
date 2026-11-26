@@ -1367,17 +1367,16 @@ fn compile_read_line_command(
         return compilation_error(lines, line, ERR_SANDBOX);
     }
     let path = read_file_path(lines, line)?;
-    let reader = match context
+    let reader = if let Some(reader) = context
         .read_line_files
         .iter()
         .find(|reader| reader.borrow().path == path)
     {
-        Some(reader) => Rc::clone(reader),
-        None => {
-            let reader = Rc::new(RefCell::new(NamedReader::new(path)));
-            context.read_line_files.push(Rc::clone(&reader));
-            reader
-        }
+        Rc::clone(reader)
+    } else {
+        let reader = Rc::new(RefCell::new(NamedReader::new(path)));
+        context.read_line_files.push(Rc::clone(&reader));
+        reader
     };
     cmd.data = CommandData::NamedReader(reader);
     Ok(CommandHandling::Continue)

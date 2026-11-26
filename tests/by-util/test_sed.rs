@@ -1359,7 +1359,7 @@ fn unterminated_file_ends_its_line_before_the_next_file() {
     std::fs::write(&b, b"4\n5\n").unwrap();
     std::fs::write(&empty, b"").unwrap();
     for (args, expected) in [
-        (vec!["".to_string()], &b"x\n4\n5\n"[..]),
+        (vec![String::new()], &b"x\n4\n5\n"[..]),
         (vec!["-n".into(), "p".into()], b"x\n4\n5\n"),
         (vec!["N;N".into()], b"x\n4\n5\n"),
         (vec!["l".into()], b"x$\nx\n4$\n4\n5$\n5\n"),
