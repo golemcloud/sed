@@ -2790,6 +2790,35 @@ fn last_line_looks_past_empty_and_unreadable_operands() {
     result.stdout_is("3\n");
 }
 
+/// Looking for the last line keeps no empty operand open, so more empty operands than the
+/// descriptor limit allows still let a later operand's last line be found. Verified against
+/// the oracle with `ulimit -n 32`.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn last_line_looks_past_more_empty_operands_than_open_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first");
+    let last = dir.path().join("last");
+    std::fs::write(&first, b"1\n2\n").unwrap();
+    std::fs::write(&last, b"x\ny\n").unwrap();
+    let empties: Vec<_> = (0..60)
+        .map(|i| {
+            let path = dir.path().join(format!("e{i}"));
+            std::fs::write(&path, b"").unwrap();
+            path
+        })
+        .collect();
+    new_ucmd!()
+        .limit(rlimit::Resource::NOFILE, 32, 32)
+        .args(&["-n", "$p"])
+        .arg(&first)
+        .args(&empties)
+        .arg(&last)
+        .succeeds()
+        .no_stderr()
+        .stdout_is("y\n");
+}
+
 #[test]
 fn in_place_edit_backup() -> std::io::Result<()> {
     let dir = tempfile::tempdir()?;

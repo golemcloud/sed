@@ -725,13 +725,14 @@ impl LaterFiles {
                 return Ok(true);
             }
         }
+        // An empty operand is closed rather than kept: it has no line to give, and keeping
+        // each one open could use up the descriptors that a later operand needs.
         while let Some((index, path)) = self.unopened.pop_front() {
-            if let Some(mut reader) = Self::open(&path, self.delimiter) {
-                let empty = reader.last_line()?;
+            if let Some(mut reader) = Self::open(&path, self.delimiter)
+                && !reader.last_line()?
+            {
                 self.opened.push_back((index, path, reader));
-                if !empty {
-                    return Ok(true);
-                }
+                return Ok(true);
             }
         }
         Ok(false)
